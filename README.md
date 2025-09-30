@@ -1,104 +1,125 @@
-# 🤖 Full Multi-Modal RAG System
+# Multimodal RAG Engine
 
-This project is a sophisticated, multi-process Python application that implements a Retrieval-Augmented Generation (RAG) system capable of handling a wide variety of file types. You can upload images, audio, PDFs, Word documents, CSVs, and text files to build a knowledge base, and then ask questions about the content.
+This project is a sophisticated, multimodal Retrieval-Augmented Generation (RAG) engine. It provides a backend service that can ingest various types of documents, including text files, PDFs, audio, and images, and answer questions based on the ingested knowledge.
 
 ## Features
 
-*   **Multi-Modal:**  Handles various file formats, including images (`.png`, `.jpg`), audio (`.mp3`, `.wav`), documents (`.pdf`, `.docx`, `.txt`), and data files (`.csv`).
-*   **RAG Architecture:**  Utilizes a RAG pipeline to retrieve relevant context from the knowledge base and generate informed answers.
-*   **Web Interface:**  A user-friendly web interface built with Gradio for easy file uploads and interaction.
-*   **Microservice-based:** The system is broken down into three distinct services for better organization and scalability:
-    *   A Whisper service for audio transcription.
-    *   A SmolVLM service for image understanding.
-    *   A central Gradio app for orchestration.
-*   **Efficient Vector Search:**  Employs FAISS for fast and efficient similarity search in the vector database.
+- **Multimodal Knowledge Base:** Ingest and understand information from a wide range of file types:
+    - Documents: `.pdf`, `.docx`, `.txt`, `.csv`
+    - Audio: `.mp3`, `.wav`, `.m4a` (transcribed using Whisper)
+    - Images: `.png`, `.jpg`, `.jpeg` (analyzed for both visual content and text)
+- **Advanced Image Analysis:** Utilizes a dual-approach for images:
+    - **OCR:** Extracts text from images using EasyOCR.
+    - **Visual Embedding:** Creates a vector representation of the image's visual content using CLIP.
+- **Intelligent Chat Orchestration:** Features a powerful chat interface that:
+    - Searches across all content types (text and images) to find the most relevant information.
+    - Uses a large language model (`Qwen`) as an orchestrator.
+    - Intelligently routes tasks to a specialized multimodal model (`SmolVLM`) when visual analysis is required.
+- **Voice-Enabled Queries:** Supports asking questions via audio input directly to the chat endpoint.
 
-## Project Structure
+## Architecture
 
-```
-multimodal-rag-project/
-├── app.py                  # The main Gradio application and orchestrator
-├── requirements.txt        # Python dependencies
-├── services/
-│   ├── smolvlm_service.py  # Flask service for image-related tasks
-│   └── whisper_service.py  # Flask service for audio transcription
-├── uploads/                # Directory for uploaded files
-├── .git/
-├── .gradio/
-├── bot.png
-└── user.png
-```
+The backend is built with **FastAPI** and consists of two main services that are launched automatically:
 
-## Models Used
+1.  **Main Backend (`main.py`):** Handles ingestion, retrieval, and orchestration.
+2.  **Multimodal Service (`services/smolvlm_service.py`):** A dedicated service for answering questions about images.
 
-This project leverages several open-source models:
+The RAG pipeline uses two separate in-memory **FAISS** vector stores:
+- A **Text Vector Store** for embeddings of documents, audio transcriptions, and OCR text.
+- An **Image Vector Store** for visual embeddings of images.
 
-*   **`all-MiniLM-L6-v2`**: A `SentenceTransformer` model for creating text embeddings.
-*   **`Qwen3-0.6B-Q4_K_M-GGUF`**: A quantized version of the Qwen2 model, used as the orchestrator for text-based question answering.
-*   **`SmolVLM2-500M-Video-Instruct-GGUF`**: A vision language model for describing images and answering questions about them.
-*   **`faster-whisper`**: A reimplementation of OpenAI's Whisper model for fast and accurate audio transcription.
+### Models Used
 
-## How to Run
+- **Text Embedding:** `all-MiniLM-L6-v2`
+- **Image Embedding:** `clip-ViT-B-32`
+- **Orchestrator LLM:** `Qwen3-4B-Instruct-2507-GGUF`
+- **Vision-Language Model:** `SmolVLM2-2.2B-Instruct-GGUF`
+- **Audio Transcription:** `faster-whisper (base)`
+- **OCR:** `EasyOCR`
 
-### 1. Prerequisites
+## Setup and Installation
 
-*   Python 3.8+
-*   A virtual environment (recommended)
+1.  **Prerequisites:**
+    - Python 3.9+
+    - `pip`
 
-### 2. Setup
+2.  **Clone the repository:**
+    ```bash
+    git clone <repository-url>
+    cd multimodal-rag-project
+    ```
 
-First, clone the project and create a directory for file uploads.
+3.  **Install Python dependencies:**
+    Navigate to the `backend` directory and install the required packages.
+    ```bash
+    cd backend
+    pip install -r requirements.txt
+    ```
+    *(Note: The first time you run the application, EasyOCR and Hugging Face Transformers will download their required models. This is a one-time setup.)*
 
+## Running the Project
+
+The application is designed to be simple to run. All necessary services are started automatically.
+
+From the `backend` directory, run:
 ```bash
-git clone <your-repo-url>
-cd multimodal-rag-project
-mkdir uploads
+python main.py
 ```
+This single command will:
+- Start the multimodal `smolvlm_service` in the background.
+- Start the main FastAPI server on `http://127.0.0.1:8000`.
 
-Next, create a virtual environment and install the required dependencies.
+The server is now ready to accept API requests.
 
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-pip install -r requirements.txt
-```
+## API Endpoints
 
-### 3. Run the Services
+The following endpoints are available:
 
-You need to run each component in a separate terminal.
+#### `POST /ingest`
+Uploads and processes a list of files to build the knowledge base. This clears any previously ingested data.
 
-**Terminal 1: Start the Whisper Service**
+- **Body:** `multipart/form-data` with a `files` field containing one or more files.
+- **Example (`curl`):**
+  ```bash
+  curl -X POST -F "files=@document1.pdf" -F "files=@image1.png" http://127.0.0.1:8000/ingest
+  ```
 
-```bash
-python services/whisper_service.py
-```
-You should see output indicating the Flask server is running on port 5001.
+#### `POST /chat`
+Asks a question to the RAG engine using a text query.
 
-**Terminal 2: Start the SmolVLM Service**
+- **Body:** JSON payload with a `query` field.
+  ```json
+  {
+    "query": "What is the main topic of the document?"
+  }
+  ```
+- **Example (`curl`):**
+  ```bash
+  curl -X POST -H "Content-Type: application/json" -d '{"query": "What is written in the image?"}' http://127.0.0.1:8000/chat
+  ```
 
-```bash
-python services/smolvlm_service.py
-```
-This will take some time to load the model. You should see output indicating the Flask server is running on port 5002.
+#### `POST /chat-audio`
+Asks a question to the RAG engine using an audio file.
 
-**Terminal 3: Start the Main Gradio App**
+- **Body:** `multipart/form-data` with a `file` field containing a single audio file.
+- **Example (`curl`):**
+  ```bash
+  curl -X POST -F "file=@my_question.mp3" http://127.0.0.1:8000/chat-audio
+  ```
 
-```bash
-python app.py
-```
-This will provide a public or local URL for the Gradio interface. Open it in your browser to use the application.
+#### `POST /transcribe`
+Transcribes a given audio file and returns the text.
 
-### 4. How to Use
+- **Body:** `multipart/form-data` with a `file` field containing a single audio file.
+- **Example (`curl`):**
+  ```bash
+  curl -X POST -F "file=@meeting_notes.wav" http://127.0.0.1:8000/transcribe
+  ```
 
-1.  Open the Gradio URL in your browser.
-2.  Upload any combination of supported files.
-3.  Click the "**⚙️ Process Files**" button and wait for the confirmation message.
-4.  Ask questions about the content of your uploaded files in the chatbox.
+#### `POST /reset`
+Clears all knowledge bases (both text and images).
 
-## Contributing
-
-Contributions are welcome! Please feel free to open an issue or submit a pull request.
-
-## License
-
-This project is licensed under the MIT License.
+- **Example (`curl`):**
+  ```bash
+  curl -X POST http://127.0.0.1:8000/reset
+  ```
