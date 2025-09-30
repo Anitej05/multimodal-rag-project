@@ -56,6 +56,12 @@ The RAG pipeline uses two separate in-memory **FAISS** vector stores:
     pip install -r requirements.txt
     ```
     *(Note: The first time you run the application, EasyOCR and Hugging Face Transformers will download their required models. This is a one-time setup.)*
+    
+    if llama-cpp-python error persists(failed to build wheels), do this(applicable to windows users)
+    ```bash
+    pip install --no-cache-dir llama-cpp-python==0.2.77 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+    ```
+
 
 ## Running the Project
 
