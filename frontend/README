@@ -1,0 +1,17 @@
+# Multimodal RAG - Frontend (Plain CSS)
+
+Files: index.html, styles.css, api.js, app.js
+
+## Setup
+1. Put these files in your frontend folder (e.g. `D:\multimodal-rag-project\frontend`).
+2. Ensure your backend FastAPI server is running (default `http://127.0.0.1:8000`).
+3. Serve the frontend folder as static files. E.g.:
+   - `npx serve .`
+   - or open `index.html` directly in browser.
+4. Use "Select files" to choose documents/images/audio, then click "Index Knowledge Base" to call `/ingest`.
+5. Ask questions in the Assistant area and click Send. To send audio, attach audio file or record.
+
+## Notes
+- This frontend keeps selected files in memory until you index them.
+- Reset will call the backend `/reset` which clears the entire knowledge base.
+- If your backend runs at a different host/port, edit `API_BASE_URL` in `api.js`.
