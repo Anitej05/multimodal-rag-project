@@ -1,0 +1,26 @@
+# Core ML/DL
+transformers
+sentence-transformers
+faiss-cpu
+faster-whisper
+llama-cpp-python
+huggingface_hub
+
+# Application Frameworks
+requests
+fastapi
+uvicorn
+
+# File Processing
+Pillow
+pypdf
+librosa
+soundfile
+python-docx
+pandas
+easyocr
+
+# Utilities
+numpy
+
+
