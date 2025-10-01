@@ -20,7 +20,7 @@ A modern React application for managing and querying a multimodal knowledge base
 ## Directory Structure
 
 ```
-multimodal-rag-react/
+frontend/
 ├── public/
 │   └── index.html
 ├── src/
