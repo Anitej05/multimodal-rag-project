@@ -10,6 +10,8 @@ A modern React application for managing and querying a multimodal knowledge base
 - 🖼️ **Image Support**: Visual file previews for images
 - 📊 **Statistics Dashboard**: Track files, indexing status, and storage
 - 🎨 **Modern UI**: Sleek, professional dark-themed interface
+- 📄 **Source Citations**: Automatic display of document sources for AI responses
+- ✅ **Custom Confirmation Dialogs**: Elegant centered notifications instead of browser popups
 
 ## Supported File Types
 
@@ -31,7 +33,8 @@ frontend/
 │   │   ├── FileUpload.jsx
 │   │   ├── FileList.jsx
 │   │   ├── Toast.jsx
-│   │   └── StatsCard.jsx
+│   │   ├── StatsCard.jsx
+│   │   └── ConfirmDialog.jsx
 │   ├── services/
 │   │   └── api.js
 │   ├── utils/
@@ -97,7 +100,7 @@ frontend/
 1. Once files are indexed, navigate to the AI Assistant section
 2. Type your question in the input field
 3. Press Enter or click the send button
-4. View AI responses in real-time
+4. View AI responses in real-time with **source citations** showing which documents the information came from
 
 ### Audio Features
 
@@ -110,6 +113,43 @@ frontend/
 - Switch to the **Files** tab to view all uploaded files
 - See file status (pending/indexed)
 - Use the **Reset** button to clear the entire knowledge base
+- Beautiful confirmation dialogs will appear for destructive actions
+
+## New Features
+
+### Source Citations
+Every AI response now includes citations showing which documents were used to generate the answer. Sources appear as elegant badges below each response, displaying:
+- Document filename
+- Page number (when available)
+- Visual indicators with icons
+
+### Custom Confirmation Dialogs
+Replaced browser popups with beautiful, centered confirmation dialogs that match the app's design:
+- Smooth animations
+- Glassmorphism effects
+- Clear OK/Cancel buttons
+- No more intrusive browser alerts
+
+### Backend Response Format
+The application expects responses in this format from your backend:
+
+```json
+{
+  "answer": "Your AI response here",
+  "source": "document_name.pdf"
+}
+```
+
+Or with multiple sources:
+```json
+{
+  "answer": "Your AI response here", 
+  "sources": [
+    {"source": "doc1.pdf", "metadata": {"page": 5}},
+    {"source": "doc2.txt"}
+  ]
+}
+```
 
 ## API Configuration
 
@@ -157,6 +197,16 @@ If you encounter CORS errors, ensure your backend API has proper CORS headers co
 - Verify the backend API is running
 - Check file size limits on your backend
 - Ensure file types are supported
+
+### Sources Not Displaying
+- Verify your backend returns `source` or `sources` in the response
+- Check browser console for any errors
+- Ensure response format matches the expected structure (see Backend Response Format above)
+
+### Confirmation Dialogs Not Appearing
+- Check if JavaScript is enabled
+- Clear browser cache and reload
+- Verify no console errors are present
 
 ## License
 
