@@ -15,9 +15,11 @@ function App() {
     setTimeout(() => setToast(null), 3000);
   };
 
-  const addMessage = (text, isUser = false) => {
+  const addMessage = (text, isUser = false, sources = []) => {
     const time = formatTime();
-    setMessages(prev => [...prev, { text, isUser, time }]);
+    const newMessage = { text, isUser, time, sources };
+    console.log('Adding message to state:', newMessage); // Debug
+    setMessages(prev => [...prev, newMessage]);
   };
 
   return (

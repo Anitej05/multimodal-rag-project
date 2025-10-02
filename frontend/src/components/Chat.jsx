@@ -30,7 +30,7 @@ const Chat = ({ messages, addMessage, showToast }) => {
     }
 
     if (audio) {
-      addMessage('🎤 [Audio message]', true);
+      addMessage('🎤 [Audio message]', true, []);
       setChatInput('');
       setAudioFile(null);
       if (audioInputRef.current) audioInputRef.current.value = '';
@@ -38,10 +38,19 @@ const Chat = ({ messages, addMessage, showToast }) => {
       setIsTyping(true);
       try {
         const res = await api.chatAudio(audio);
-        addMessage(res.answer || res.response || 'No response from assistant', false);
+        const messageText = res.answer || res.response || 'No response from assistant';
+        let sources = [];
+        if (res.source) {
+          sources = [{ source: res.source }];
+        } else if (res.sources) {
+          sources = Array.isArray(res.sources) ? res.sources : [];
+        } else if (res.source_documents) {
+          sources = Array.isArray(res.source_documents) ? res.source_documents : [];
+        }
+        addMessage(messageText, false, sources);
       } catch (err) {
         console.error(err);
-        addMessage(`❌ Audio chat error: ${err.message}`, false);
+        addMessage(`❌ Audio chat error: ${err.message}`, false, []);
         showToast(`Audio chat failed: ${err.message}`, 'error');
       } finally {
         setIsTyping(false);
@@ -49,7 +58,7 @@ const Chat = ({ messages, addMessage, showToast }) => {
       return;
     }
 
-    addMessage(text, true);
+    addMessage(text, true, []);
     setChatInput('');
     if (chatInputRef.current) {
       chatInputRef.current.style.height = 'auto';
@@ -58,10 +67,19 @@ const Chat = ({ messages, addMessage, showToast }) => {
     setIsTyping(true);
     try {
       const res = await api.chatText(text);
-      addMessage(res.answer || res.response || 'No response from assistant', false);
+      const messageText = res.answer || res.response || 'No response from assistant';
+      let sources = [];
+      if (res.source) {
+        sources = [{ source: res.source }];
+      } else if (res.sources) {
+        sources = Array.isArray(res.sources) ? res.sources : [];
+      } else if (res.source_documents) {
+        sources = Array.isArray(res.source_documents) ? res.source_documents : [];
+      }
+      addMessage(messageText, false, sources);
     } catch (err) {
       console.error(err);
-      addMessage(`❌ Error: ${err.message}`, false);
+      addMessage(`❌ Error: ${err.message}`, false, []);
       showToast(`Chat failed: ${err.message}`, 'error');
     } finally {
       setIsTyping(false);
@@ -166,7 +184,14 @@ const Chat = ({ messages, addMessage, showToast }) => {
               </div>
             ) : (
               <>
-                {messages.map((msg, idx) => (
+                {messages.map((msg, idx) => {
+                  // Check if sources exist and are valid
+                  const hasSources = !msg.isUser && 
+                                    msg.sources && 
+                                    Array.isArray(msg.sources) && 
+                                    msg.sources.length > 0;
+                  
+                  return (
                   <div key={idx} className={`message ${msg.isUser ? 'message-user' : 'message-assistant'}`}>
                     <div className="message-avatar">
                       {msg.isUser ? '👤' : '🤖'}
@@ -180,10 +205,42 @@ const Chat = ({ messages, addMessage, showToast }) => {
                           </React.Fragment>
                         ))}
                       </div>
+                      {hasSources && (
+                        <div className="message-sources">
+                          <div className="sources-header">📚 Sources:</div>
+                          {msg.sources.map((source, sIdx) => {
+                            let filename = 'Unknown Source';
+                            
+                            if (typeof source === 'string') {
+                              filename = source;
+                            } else if (source && typeof source === 'object') {
+                              filename = source.source || 
+                                        source.metadata?.filename || 
+                                        source.metadata?.source || 
+                                        source.filename ||
+                                        `Document ${sIdx + 1}`;
+                            }
+                            
+                            if (filename && (filename.includes('/') || filename.includes('\\'))) {
+                              filename = filename.split(/[/\\]/).pop();
+                            }
+                            
+                            return (
+                              <div key={sIdx} className="source-item">
+                                <span className="source-icon">📄</span>
+                                <span className="source-name">{filename}</span>
+                                {source && source.metadata && source.metadata.page && (
+                                  <span className="source-page">Page {source.metadata.page}</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                       <div className="message-time">{msg.time}</div>
                     </div>
                   </div>
-                ))}
+                )})}
                 {isTyping && (
                   <div className="message message-assistant">
                     <div className="message-avatar">🤖</div>
