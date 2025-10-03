@@ -25,8 +25,21 @@ const KnowledgeBase = ({ uploadedFiles, setUploadedFiles, showToast, addMessage 
 
     try {
       const filesToSend = uploadedFiles.map(f => f.file);
-      await api.ingestFiles(filesToSend);
-      setUploadedFiles(prev => prev.map(u => ({ ...u, status: 'indexed' })));
+      const result = await api.ingestFiles(filesToSend);
+
+      // Check if indexing was successful
+      if (result.status !== 'ok') {
+        throw new Error(result.message);
+      }
+
+      // Update status and add timestamp for tracking
+      const indexedTime = new Date().toLocaleTimeString();
+      setUploadedFiles(prev => prev.map(u => ({
+        ...u,
+        status: 'indexed',
+        indexedAt: indexedTime
+      })));
+
       showToast(`Successfully indexed ${uploadedFiles.length} file(s)`, 'success');
       addMessage(`✅ Indexed ${uploadedFiles.length} file(s) into the knowledge base. You can now ask questions about your documents.`, false);
     } catch (err) {
@@ -93,7 +106,11 @@ const KnowledgeBase = ({ uploadedFiles, setUploadedFiles, showToast, addMessage 
       {/* Upload Tab */}
       {activeTab === 'upload' && (
         <div style={{ marginTop: '18px' }}>
-          <FileUpload onFilesAdded={handleFilesAdded} />
+          <FileUpload
+            onFilesAdded={handleFilesAdded}
+            uploadedFiles={uploadedFiles}
+            showUploadedFiles={uploadedFiles.some(f => f.status !== 'indexed')}
+          />
           
           <StatsCard uploadedFiles={uploadedFiles} />
 
