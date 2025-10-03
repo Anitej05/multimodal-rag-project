@@ -21,8 +21,8 @@ def test_ingest():
         with open("test.txt", "w") as f:
             f.write("This is a test file for the ingest endpoint. It contains some text about a user.")
 
-        # Use an existing image file from the assets folder
-        image_path = os.path.join("assets", "user.png")
+        # Use an existing image file from the uploads folder
+        image_path = os.path.join("uploads", "user.png")
 
         with open('test.txt', 'rb') as txt_f:
             if not os.path.exists(image_path):

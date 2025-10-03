@@ -37,9 +37,15 @@ except Exception as e:
     llm = None
 
 
-def image_to_base64(image):
+def image_to_base64_optimized(image):
+    # Resize image to reduce token usage (from ~50K to ~5K tokens)
+    max_size = 512
+    if image.width > max_size or image.height > max_size:
+        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+
     buffered = BytesIO()
-    image.save(buffered, format="JPEG")
+    # Use lower quality to further reduce size
+    image.save(buffered, format="JPEG", quality=85, optimize=True)
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
@@ -49,12 +55,12 @@ async def describe_image(file: UploadFile = File(...)):
         return {"error": "Model not loaded"}
     try:
         image = Image.open(file.file).convert("RGB")
-        image_b64 = image_to_base64(image)
+        image_b64 = image_to_base64_optimized(image)
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                {"type": "text", "text": "Describe this image in detail."}
+                {"type": "text", "text": "Describe this image concisely in 2-3 sentences. Focus on key elements and avoid unnecessary details."}
             ]}
         ]
         response = llm.create_chat_completion(messages=messages)
@@ -70,7 +76,7 @@ async def answer_question(query: str = Form(...), file: UploadFile = File(...)):
         return {"error": "Model not loaded"}
     try:
         image = Image.open(file.file).convert("RGB")
-        image_b64 = image_to_base64(image)
+        image_b64 = image_to_base64_optimized(image)
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": [
@@ -87,5 +93,3 @@ async def answer_question(query: str = Form(...), file: UploadFile = File(...)):
 
 if __name__ == '__main__':
     uvicorn.run(app, host='0.0.0.0', port=5002)
-
-

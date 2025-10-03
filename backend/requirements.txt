@@ -1,26 +1,17 @@
-# Core ML/DL
-transformers
-sentence-transformers
+torch
 faiss-cpu
-faster-whisper
-llama-cpp-python
-huggingface_hub
-
-# Application Frameworks
-requests
 fastapi
 uvicorn
-
-# File Processing
-Pillow
+sentence-transformers
+llama-cpp-python
+huggingface_hub
 pypdf
-librosa
-soundfile
 python-docx
 pandas
-easyocr
-
-# Utilities
+faster-whisper
 numpy
-
+easyocr
+Pillow
+soundfile
+kokoro>=0.9.2
 
