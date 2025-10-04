@@ -302,6 +302,30 @@ def detect_visual_query_qwen(query: str) -> Tuple[bool, float]:
         matches = [kw for kw in visual_keywords if kw in query_lower]
         return len(matches) > 0, min(0.7, len(matches) * 0.2)
 
+def detect_modality(query: str, document_names: List[str]) -> dict:
+    """
+    Detect modality to boost based on user query and available documents.
+    """
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an intelligent assistant that determines which modality to boost for a search. Your options are \"text\", \"image\", or \"audio\". Respond with a JSON object containing the modality to boost and the boost value (e.g., {\"boost_modality\": \"image\", \"boost_value\": 1.5})."
+            },
+            {
+                "role": "user",
+                "content": f'Given the user query \"{query}\" and the following documents in the knowledge base: {document_names}, which modality should be boosted?'
+            }
+        ]
+        response_content = call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=100, temperature=0.1)
+        parsed = json.loads(response_content)
+        boost_modality = parsed.get("boost_modality", "text")
+        boost_value = parsed.get("boost_value", 1.0)
+        return {boost_modality: boost_value}
+    except Exception as e:
+        print(f"Error in modality detection: {e}")
+        return {"text": 1.0, "image": 1.0, "audio": 1.0}
+
 def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     """
     Unified multimodal retrieval that searches across all content types simultaneously.
@@ -310,32 +334,14 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     """
     print(f"\n=== DEBUG: retrieve_multimodal_context called with query: {query!r} ===")
 
-    # Query-specific weighting for better multimodal balance
-    # Enhanced visual keywords to better detect when user is asking about images
-    visual_keywords = [
-        'image', 'picture', 'photo', 'visual', 'show me', 'describe', 'mountain', 'diagram', 'chart',
-        'graph', 'photo of', 'image of', 'picture of', 'visualize', 'look like', 'what is this',
-        'what does', 'appear', 'looks like', 'depicts', 'illustrates', 'scene', 'object in',
-        'see in', 'view', 'screenshot', 'snapshot', 'portrait', 'landscape', 'object'
-    ]
-
-    # Calculate visual query confidence based on keyword matches
-    query_lower = query.lower()
-    visual_matches = [keyword for keyword in visual_keywords if keyword in query_lower]
-    is_visual_query = len(visual_matches) > 0
-
-    # Increase the visual boost based on how many visual keywords were detected
-    if is_visual_query:
-        visual_boost = 1.5 + (len(visual_matches) * 0.2)  # Additional boost for each keyword match
-        visual_boost = min(visual_boost, 3.0)  # Cap the boost to prevent overwhelming text results
-    else:
-        visual_boost = 1.0
-
-    print(f"DEBUG: Visual query detected: {is_visual_query}, matched keywords: {visual_matches}, applying {visual_boost}x boost to images")
+    # 1. DETECT MODALITY
+    document_names = [os.path.basename(meta['source_path']) for meta in text_metadata]
+    modality_boosts = detect_modality(query, document_names)
+    print(f"DEBUG: Modality boosts: {modality_boosts}")
 
     all_candidates = []
 
-    # 1. SEARCH TEXT CONTENT (includes text from documents and image descriptions)
+    # 2. SEARCH TEXT CONTENT (includes text from documents and image descriptions)
     print(f"DEBUG: Text vector store size: {text_vector_store.ntotal}")
     if text_vector_store.ntotal > 0:
         query_text_embedding = embedding_model.encode(query, convert_to_tensor=True).cpu().numpy().reshape(1, -1)
@@ -345,57 +351,47 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
         for i, idx in enumerate(indices[0]):
             if idx < len(text_metadata):
                 source_path = text_metadata[idx]["source_path"]
-                raw_distance = distances[0][i]  # This is the raw distance from FAISS
-                print(f"DEBUG: Text candidate {i}: {os.path.basename(source_path)} (distance: {raw_distance:.3f})")
-
-                # Determine if this is a text from an image (description or OCR)
+                raw_distance = distances[0][i]
+                score = normalize_score(raw_distance, "text_faiss")
+                
+                modality = "text"
                 if source_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    candidate_type = "image_description"  # Now using smolvlm descriptions instead of OCR
-                else:
-                    candidate_type = "text"
+                    modality = "image"
+                elif source_path.lower().endswith(('.mp3', '.wav', '.m4a')):
+                    modality = "audio"
+
+                boost = modality_boosts.get(modality, 1.0)
+                boosted_score = score * boost
 
                 all_candidates.append({
                     "source": source_path,
                     "text": text_metadata[idx]["text"],
-                    "text_score": normalize_score(raw_distance, "text_faiss"),  # Pass raw distance to normalize function
-                    "type": candidate_type,
-                    "modality": "text"
+                    "text_score": boosted_score,
+                    "type": "text" if modality != "image" else "image_description",
+                    "modality": modality
                 })
 
     # 3. RE-RANK USING CROSS-ENCODER (for text content)
     text_candidates = [c for c in all_candidates if c.get("text", "").strip()]
-    print(f"DEBUG: Found {len(text_candidates)} text candidates for cross-encoder")
-
     if text_candidates and cross_encoder_model is not None:
         try:
             pairs = [[query, cand["text"]] for cand in text_candidates]
             cross_encoder_scores = cross_encoder_model.predict(pairs)
-
             for i, candidate in enumerate(text_candidates):
                 candidate["cross_encoder_score"] = normalize_score(cross_encoder_scores[i], "cross_encoder")
-                print(f"DEBUG: Cross-encoder score for {os.path.basename(candidate['source'])}: {cross_encoder_scores[i]:.3f}")
         except Exception as e:
             print(f"DEBUG: Cross-encoder failed: {e}")
-    else:
-        print("DEBUG: Skipping cross-encoder (no model or no text candidates)")
 
     # 4. CALCULATE FINAL SCORES
     for candidate in all_candidates:
         candidate["final_score"] = calculate_final_score(candidate)
 
-        # Apply query-specific boost for visual queries
-        if is_visual_query and candidate.get("text_score", 0) > 0:
-            candidate["final_score"] *= visual_boost
-            print(f"DEBUG: Applied {visual_boost}x visual boost to {os.path.basename(candidate['source'])}")
-
-        print(f"DEBUG: Final score for {os.path.basename(candidate['source'])}: {candidate['final_score']:.3f}")
-
-    # 5. SORT BY FINAL SCORE (unified ranking across all modalities)
+    # 5. SORT BY FINAL SCORE
     all_candidates.sort(key=lambda x: x["final_score"], reverse=True)
 
     # 6. RETURN TOP RESULTS
-    top_results = all_candidates[:3]
-    print(f"DEBUG: Top 3 results:")
+    top_results = all_candidates[:5]
+    print(f"DEBUG: Top 5 results:")
     for i, result in enumerate(top_results, 1):
         print(f"  {i}. {os.path.basename(result['source'])} (score: {result['final_score']:.3f}, type: {result['type']})")
 
@@ -578,146 +574,90 @@ async def chat(payload: ChatRequest):
         return {"answer": "Knowledge base is empty. Please ingest files first."}
 
     try:
-        # NEW: Unified Multimodal Pipeline Selection
-        # Find the best image match (if any) from the unified search results
-        image_contexts = [ctx for ctx in contexts if ctx['source'].lower().endswith(('.png', '.jpg', '.jpeg'))]
+        # 1. JUDGE a subset of top contexts
+        context_for_judgement = "".join(
+            f"[Source: {os.path.basename(ctx[\"source\"])}, Score: {ctx[\"final_score\"]:.2f}]\n{ctx[\"text\"]}\n\n" 
+            for ctx in contexts
+        )
 
-        if image_contexts:
-            # Use the highest-scored image for analysis
-            best_image_context = image_contexts[0]
-            print(f"Activating Multimodal Pipeline with image: {os.path.basename(best_image_context['source'])}")
+        judge_messages = [
+            {
+                "role": "system",
+                "content": "You are a judge that selects the most relevant sources to answer a user's query. Respond with a JSON object containing a list of the best source filenames (e.g., {\"best_sources\": [\"source1.pdf\", \"image2.png\"]})."
+            },
+            {
+                "role": "user",
+                "content": f'Given the user query \"{payload.query}\" and the following sources, which are the most relevant?\n\n{context_for_judgement}'
+            }
+        ]
 
-            source_path = best_image_context["source"]
-            print(f"DEBUG: Calling LM Studio vision model for visual QA with query: {payload.query}")
+        try:
+            response_content = call_lm_studio_text(judge_messages, model="qwen3-1.7b", max_tokens=200, temperature=0.1)
+            judged_sources_data = json.loads(response_content)
+            judged_source_names = judged_sources_data.get("best_sources", [])
+            
+            # Filter the original contexts to only include the judged ones
+            final_contexts = [ctx for ctx in contexts if os.path.basename(ctx["source"]) in judged_source_names]
+            if not final_contexts:
+                final_contexts = contexts # Fallback to all contexts if judge returns empty
 
-            # Get vision analysis using LM Studio
-            vision_answer = call_lm_studio_vision(source_path, payload.query)
-            print(f"DEBUG: LM Studio vision answer: {vision_answer}")
-            print(f"DEBUG: Answer length: {len(vision_answer)} characters")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Error parsing judge response: {e}")
+            final_contexts = contexts # Fallback to all contexts
 
-            # Enhanced context: combine text content with image analysis
-            text_contexts = [ctx for ctx in contexts if ctx.get('text', '').strip()]
-            if text_contexts:
-                additional_context = "\n".join([ctx['text'] for ctx in text_contexts[:2]])  # Include top 2 text contexts
-                combined_context = f"{additional_context}\n\nIMAGE ANALYSIS: {vision_answer}"
-            else:
-                combined_context = vision_answer
+        # 2. GENERATE RESPONSE with the selected contexts
+        context_str = "\n".join([ctx['text'] for ctx in final_contexts])
+        unique_sources = list(set([ctx["source"] for ctx in final_contexts]))
+        sources_list = []
+        for i, source_path in enumerate(unique_sources, 1):
+            clean_name = os.path.splitext(os.path.basename(source_path))[0]
+            sources_list.append(f'<div class="source-item"><p class="source-name">{clean_name}</p></div>')
+        sources_str = "\n".join(sources_list)
 
-            # Create properly formatted sources with clean names and correct citation mapping
-            unique_sources = list(set([ctx["source"] for ctx in contexts]))
-            sources_list = []
+        messages = [
+            {
+                "role": "system",
+                "content": f'''
+                You are a Multimodal RAG agent. Your capabilities include processing and synthesizing information from a diverse range of file types, including text documents, images, and audio transcripts. When formulating a response, you must adhere to the following guidelines:
 
-            for i, source_path in enumerate(unique_sources, 1):
-                # Clean the filename (remove extension and path)
-                clean_name = os.path.splitext(os.path.basename(source_path))[0]
-                sources_list.append(f'<div class="source-item"><span class="source-key">[{i}]</span><span class="source-name">{clean_name}</span></div>')
+                1.  **Synthesize Information:** Generate a comprehensive and coherent answer based on the provided context. This context may be derived from multiple sources and modalities.
+                2.  **Cite Sources:** For each piece of information drawn from the context, you must provide an inline citation in the format `[1]`, `[2]`, etc. The citation number should correspond to the source file from which the information was extracted.
+                3.  **Format Response:** The entire response must be formatted as HTML. This includes paragraphs, lists, bold and italic text, and any other necessary HTML elements.
+                4.  **Provide a Sources Section:** At the end of your response, include a separator (`--%Sources%--`) followed by a "Sources" section. This section must be enclosed in a `div` with the class `sources-section` and contain a list of the source files used to generate the response.
 
-            sources_str = "\n".join(sources_list)
+                Your response should follow this structure:
 
-            messages = [
-                {"role": "system", "content": f"""
-                You are a helpful AI assistant with access to multimodal content. Answer from the provided context, which may include both text and image analysis. Format your entire response as HTML. Include inline citations in the format [1], [2], etc. at the end of sentences where the information came from the context. Place the citation number before the period at the end of the sentence.
-
-                After your main response, include a separator: --%Sources%--
-
-                After the separator, provide a "Sources" section using this exact HTML structure:
-                <div class="sources-section">
-                  <h3>Sources</h3>
-                  {sources_str}
-                </div>
-
-                Your entire response should follow this structure:
-                MAIN RESPONSE CONTENT WITH [1] STYLE CITATIONS
+                ```html
+                <p>This is a paragraph of the response with a citation.[1] This is another sentence with a citation from a different source.[2]</p>
+                <ul>
+                    <li>This is a list item with a citation.[1]</li>
+                </ul>
                 --%Sources%--
                 <div class="sources-section">
                   <h3>Sources</h3>
                   <div class="source-item">
                     <span class="source-key">1</span>
-                    <span class="source-name">source_name</span>
+                    <span class="source-name">source_name_1</span>
+                  </div>
+                  <div class="source-item">
+                    <span class="source-key">2</span>
+                    <span class="source-name">source_name_2</span>
                   </div>
                 </div>
-
-                CRITICAL: Use ONLY the actual filenames provided in the sources section. Do NOT make up or invent source names like "image_analysis.txt" or "caption_inference.txt". Use the real filenames exactly as provided.
-
-                Use proper HTML formatting for all content - paragraphs, lists, bold, italics, etc. Do not output raw markdown, only HTML.
-                The citation numbers in the sources section should NOT have brackets around them.
-                """},
-                {"role": "user", "content": f"USER'S QUESTION: {payload.query}\n\nRELEVANT CONTEXT:\n{combined_context}"}
-            ]
-
-            # Use LM Studio for final response generation
-            final_answer = call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=1500, temperature=0.7)
-
-            return {
-                "answer": final_answer
+                ```
+                '''
+            },
+            {
+                "role": "user",
+                "content": f"CONTEXT:\n{context_str}\n\nUSER'S QUESTION: {payload.query}\n\n--%Sources%--\n<div class=\"sources-section\">\n<h3>Sources</h3>\n{sources_str}\n</div>"
             }
+        ]
 
-        else:
-            # Text-only pipeline (no relevant images found)
-            print("Activating Text Pipeline...")
-            text_contexts = [ctx for ctx in contexts if ctx.get('text', '').strip()]
+        final_answer = call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=1500, temperature=0.7)
 
-            if not text_contexts:
-                return {"answer": "No relevant text content found. Please ingest some documents first."}
-
-            context_str = "\n".join([ctx['text'] for ctx in text_contexts])
-
-            # Create properly formatted sources with clean names and correct citation mapping
-            unique_sources = list(set([ctx["source"] for ctx in contexts]))
-            sources_list = []
-
-            for i, source_path in enumerate(unique_sources, 1):
-                # Clean the filename (remove extension and path)
-                clean_name = os.path.splitext(os.path.basename(source_path))[0]
-                sources_list.append(f'<div class="source-item"><p class="source-name">{clean_name}</p></div>')
-
-            sources_str = "\n".join(sources_list)
-
-            # Debug: Print the generated sources for troubleshooting
-            print(f"DEBUG: Generated sources HTML: {sources_str}")
-
-            messages = [
-                {"role": "system", "content": f"""
-                You are a helpful AI assistant. Answer ONLY from the provided context. Format your entire response as HTML. Include inline citations in the format [1], [2], etc. at the end of sentences where the information came from the context. Place the citation number before the period at the end of the sentence.
-
-                After your main response, include a separator: --%Sources%--
-
-                After the separator, provide a "Sources" section using this exact HTML structure:
-                <div class="sources-section">
-                  <h3>Sources</h3>
-                  <div class="source-item">
-                    <span class="source-key">[1]</span>
-                    <span class="source-name">document1.docx</span>
-                  </div>
-                  <div class="source-item">
-                    <span class="source-key">[2]</span>
-                    <span class="source-name">document2.pdf</span>
-                  </div>
-                </div>
-
-                Your entire response should follow this structure:
-                MAIN RESPONSE CONTENT WITH [1] STYLE CITATIONS
-                --%Sources%--
-                <div class="sources-section">
-                  <h3>Sources</h3>
-                  <div class="source-item">
-                    <span class="source-key">1</span>
-                    <span class="source-name">source_name</span>
-                  </div>
-                </div>
-
-                Use proper HTML formatting for all content - paragraphs, lists, bold, italics, etc. Do not output raw markdown, only HTML.
-                The citation numbers in the sources section should NOT have brackets around them.
-                """},
-                {"role": "user", "content": f"CONTEXT:\n{context_str}\n\nUSER'S QUESTION: {payload.query}\n\n--%Sources%--\n<div class=\"sources-section\">\n<h3>Sources</h3>\n{sources_str}\n</div>"}
-            ]
-
-            # Use LM Studio for final response generation
-            final_answer = call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=1500, temperature=0.7)
-
-            return {
-                "answer": final_answer
-            }
+        return {
+            "answer": final_answer
+        }
 
     except Exception as e:
         return {"answer": f"Unexpected error: {e}"}
