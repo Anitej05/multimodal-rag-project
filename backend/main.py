@@ -89,9 +89,7 @@ print("Backend: All models loaded.")
 print("Backend: Initializing vector stores...")
 # Text store
 text_embedding_dim = 384
-nlist = 100  # Number of clusters
-quantizer = faiss.IndexFlatL2(text_embedding_dim)
-text_vector_store = faiss.IndexIVFFlat(quantizer, text_embedding_dim, nlist)
+text_vector_store = None  # Will be initialized dynamically
 text_metadata: List[dict] = []  # {"text": str, "source_path": str}
 
 # Image store - REMOVED as we're using text embeddings for images now
@@ -100,7 +98,7 @@ text_metadata: List[dict] = []  # {"text": str, "source_path": str}
 print("Backend: In-memory Vector DBs initialized.")
 
 # --- LM Studio API Helper Functions ---
-def call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=1000, temperature=0.7):
+def call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=1000, temperature=0.7):
     """Call LM Studio API for text generation"""
     payload = {
         "model": model,
@@ -118,7 +116,18 @@ def call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=1000, temperatu
         response.raise_for_status()
 
         result = response.json()
+
+        # Validate response structure
+        if 'choices' not in result or len(result['choices']) == 0:
+            print(f"LM Studio API returned invalid response structure: {result}")
+            return ""
+
         content = result['choices'][0]['message']['content']
+
+        # Validate content
+        if not content or not content.strip():
+            print("LM Studio API returned empty content")
+            return ""
 
         # Strip thinking tags from Qwen response
         if '<think>' in content and '</think>' in content:
@@ -128,11 +137,17 @@ def call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=1000, temperatu
             clean_content = clean_content.strip()
             return clean_content
 
-        return content
+        return content.strip()
 
+    except requests.exceptions.RequestException as e:
+        print(f"LM Studio API request error: {e}")
+        return ""
+    except (KeyError, ValueError, TypeError) as e:
+        print(f"LM Studio API response parsing error: {e}")
+        return ""
     except Exception as e:
-        print(f"LM Studio text API error: {e}")
-        raise
+        print(f"LM Studio text API unexpected error: {e}")
+        return ""
 
 def call_lm_studio_vision(image_path, query, model="smolvlm2-500m-video-instruct"):
     """Call LM Studio API for vision tasks"""
@@ -182,7 +197,48 @@ def call_lm_studio_vision(image_path, query, model="smolvlm2-500m-video-instruct
         print(f"LM Studio vision API error: {e}")
         raise
 
-# --- Helper function for safe FAISS training ---
+# --- FAISS Helper Functions ---
+def calculate_optimal_nlist(n_samples: int) -> int:
+    """
+    Calculate optimal nlist based on number of samples using FAISS best practices.
+
+    Args:
+        n_samples: Number of data points
+
+    Returns:
+        int: Optimal nlist value
+    """
+    if n_samples < 10:
+        return 1  # Minimal clustering for very small datasets
+    elif n_samples < 40:
+        return 1  # Still use minimal clustering
+    else:
+        # Use 4 * sqrt(N) heuristic, capped at 256
+        return min(int(4 * (n_samples ** 0.5)), 256)
+
+def choose_index_type(n_samples: int, embedding_dim: int):
+    """
+    Choose the best FAISS index type based on dataset size.
+
+    Args:
+        n_samples: Number of data points
+        embedding_dim: Dimension of embeddings
+
+    Returns:
+        tuple: (index, index_type) where index_type is 'flat' or 'ivf'
+    """
+    if n_samples < 39:
+        # Small dataset - use brute force (flat) index to avoid FAISS warnings
+        print(f"Using IndexFlatL2 for small dataset ({n_samples} samples)")
+        return faiss.IndexFlatL2(embedding_dim), 'flat'
+    else:
+        # Larger dataset - use IVF with calculated nlist
+        nlist = calculate_optimal_nlist(n_samples)
+        quantizer = faiss.IndexFlatL2(embedding_dim)
+        index = faiss.IndexIVFFlat(quantizer, embedding_dim, nlist)
+        print(f"Using IndexIVFFlat with nlist={nlist} for dataset ({n_samples} samples)")
+        return index, 'ivf'
+
 def safe_train_index(index, embeddings, min_points_ratio=0.8):
     """
     Safely train a FAISS index, handling cases where there aren't enough training points.
@@ -280,7 +336,7 @@ def detect_visual_query_qwen(query: str) -> Tuple[bool, float]:
             {"role": "user", "content": f"Analyze this query and determine if it would benefit from image analysis: '{query}'"}
         ]
 
-        response_content = call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=100, temperature=0.1)
+        response_content = call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=100, temperature=0.1)
 
         # Try to parse JSON response
         try:
@@ -302,29 +358,184 @@ def detect_visual_query_qwen(query: str) -> Tuple[bool, float]:
         matches = [kw for kw in visual_keywords if kw in query_lower]
         return len(matches) > 0, min(0.7, len(matches) * 0.2)
 
+def parse_simple_format(response_content: str) -> dict:
+    """
+    Parse simple key-value format responses like 'modality: text, boost: 1.2'
+    """
+    if not response_content or not response_content.strip():
+        return {}
+
+    response_content = response_content.strip()
+    
+    # Pattern to match modality: value, boost: value format
+    modality_pattern = r'modality:\s*(\w+)[,\s]*boost:\s*([\d.]+)'
+    match = re.search(modality_pattern, response_content, re.IGNORECASE)
+    
+    if match:
+        modality = match.group(1).lower()
+        boost = float(match.group(2))
+        return {modality: boost}
+    
+    # If modality-boost pattern doesn't match, try to extract any modality/boost values separately
+    modality_match = re.search(r'modality:\s*(\w+)', response_content, re.IGNORECASE)
+    boost_match = re.search(r'boost:\s*([\d.]+)', response_content, re.IGNORECASE)
+    
+    if modality_match and boost_match:
+        modality = modality_match.group(1).lower()
+        boost = float(boost_match.group(1))
+        return {modality: boost}
+    
+    # If we can't find the format, try to extract just the modality if mentioned
+    if 'image' in response_content.lower():
+        return {"image": 1.0}
+    elif 'audio' in response_content.lower():
+        return {"audio": 1.0}
+    else:
+        return {"text": 1.0}  # Default to text if nothing else matches
+
+def parse_sources_format(response_content: str) -> dict:
+    """
+    Parse simple format for sources like 'best_sources: [file1.pdf, file2.pdf]'
+    or 'best_sources: file1.pdf, file2.pdf'
+    """
+    if not response_content or not response_content.strip():
+        return {}
+
+    response_content = response_content.strip()
+    
+    # Pattern to match best_sources: [file1, file2] format
+    sources_pattern = r'best_sources:\s*\[([^\]]+)\]'
+    match = re.search(sources_pattern, response_content, re.IGNORECASE)
+    
+    if match:
+        sources_str = match.group(1)
+        # Split by comma and clean up the filenames
+        sources = [s.strip().strip('"\'') for s in sources_str.split(',')]
+        sources = [s for s in sources if s]  # Remove empty strings
+        return {"best_sources": sources}
+    
+    # Alternative pattern for best_sources: file1, file2 format (without brackets)
+    alt_pattern = r'best_sources:\s*([^\n\r]+)'
+    match = re.search(alt_pattern, response_content, re.IGNORECASE)
+    
+    if match:
+        sources_str = match.group(1)
+        # Split by comma and clean up the filenames
+        sources = [s.strip().strip('"\'') for s in sources_str.split(',')]
+        sources = [s for s in sources if s]  # Remove empty strings
+        return {"best_sources": sources}
+    
+    # If we can't find the specific format, try to extract any filenames we can find
+    # Look for common file extensions in the response
+    filename_pattern = r'[\w\-\s]+\.(pdf|docx|jpg|jpeg|png|txt|csv|wav|mp3|m4a)'
+    found_files = re.findall(filename_pattern, response_content, re.IGNORECASE)
+    if found_files:
+        # We only found the extensions, we need to get the full names
+        # This is a simpler fallback
+        pass
+    
+    return {}  # Return empty dict if no pattern matches
+
+def parse_json_with_retry(response_content: str, max_retries: int = 3) -> dict:
+    """
+    Try to parse JSON response with multiple retry attempts.
+
+    Args:
+        response_content: The response content to parse
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        dict: Parsed JSON object or empty dict if all retries fail
+    """
+    if not response_content or not response_content.strip():
+        return {}
+
+    response_content = response_content.strip()
+
+    for attempt in range(max_retries):
+        try:
+            return json.loads(response_content)
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"Retrying... (attempt {attempt + 2}/{max_retries})")
+                # Could add a small delay here if needed
+                continue
+            else:
+                print(f"All {max_retries} JSON parsing attempts failed")
+                # Try to parse in simple format as fallback
+                return parse_simple_format(response_content)
+
+    return {}
+
 def detect_modality(query: str, document_names: List[str]) -> dict:
     """
     Detect modality to boost based on user query and available documents.
     """
-    try:
-        messages = [
-            {
-                "role": "system",
-                "content": "You are an intelligent assistant that determines which modality to boost for a search. Your options are \"text\", \"image\", or \"audio\". Respond with a JSON object containing the modality to boost and the boost value (e.g., {\"boost_modality\": \"image\", \"boost_value\": 1.5})."
-            },
-            {
-                "role": "user",
-                "content": f'Given the user query \"{query}\" and the following documents in the knowledge base: {document_names}, which modality should be boosted?'
-            }
-        ]
-        response_content = call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=100, temperature=0.1)
-        parsed = json.loads(response_content)
-        boost_modality = parsed.get("boost_modality", "text")
-        boost_value = parsed.get("boost_value", 1.0)
-        return {boost_modality: boost_value}
-    except Exception as e:
-        print(f"Error in modality detection: {e}")
-        return {"text": 1.0, "image": 1.0, "audio": 1.0}
+    messages = [
+        {
+            "role": "system",
+            "content": """You are an intelligent assistant that determines which modality to boost for a search. Your options are "text", "image", or "audio". Respond ONLY with the format "modality: [modality_name], boost: [number]"
+
+Examples:
+modality: text, boost: 1.2
+modality: image, boost: 1.5
+modality: audio, boost: 1.3
+
+Response format: modality: [modality_name], boost: [number]
+- Use ONLY the format above, no additional text
+- Choose from: text, image, or audio
+- Boost value should be between 1.0 and 2.0
+- Respond with EXACTLY ONE line in the specified format"""
+        },
+        {
+            "role": "user",
+            "content": f'Given the user query "{query}" and the following documents in the knowledge base: {document_names}, which modality should be boosted?'
+        }
+    ]
+
+    max_retries = 3
+
+    for attempt in range(max_retries):
+        try:
+            print(f"Modality detection attempt {attempt + 1}/{max_retries}")
+            response_content = call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=100, temperature=0.1)
+
+            # Check if response is empty or None
+            if not response_content or not response_content.strip():
+                print(f"LM Studio returned empty response for modality detection (attempt {attempt + 1})")
+                if attempt == max_retries - 1:
+                    return {"text": 1.0}
+                continue
+
+            # Parse the simple format response
+            parsed = parse_simple_format(response_content)
+
+            if parsed:
+                # Get the first key-value pair from the parsed result
+                for modality, boost in parsed.items():
+                    print(f"Successfully detected modality: {modality} with boost {boost}")
+                    return {modality: boost}
+            else:
+                print(f"Failed to parse response for modality detection (attempt {attempt + 1})")
+                if attempt == max_retries - 1:
+                    print("All modality detection attempts failed, using fallback")
+                    break
+
+        except Exception as e:
+            print(f"Error in modality detection (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                break
+
+    # Fallback to keyword-based detection after all retries failed
+    print("Using keyword-based fallback for modality detection")
+    query_lower = query.lower()
+    if any(ext in query_lower for ext in ['image', 'picture', 'photo', 'visual', 'show me', 'describe', 'looks like', 'see', 'view', 'diagram', 'chart', 'graph']):
+        return {"image": 1.5}
+    elif any(ext in query_lower for ext in ['audio', 'sound', 'listen']):
+        return {"audio": 1.5}
+    else:
+        return {"text": 1.2} # Default to boosting text slightly
 
 def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     """
@@ -342,34 +553,39 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     all_candidates = []
 
     # 2. SEARCH TEXT CONTENT (includes text from documents and image descriptions)
-    print(f"DEBUG: Text vector store size: {text_vector_store.ntotal}")
-    if text_vector_store.ntotal > 0:
-        query_text_embedding = embedding_model.encode(query, convert_to_tensor=True).cpu().numpy().reshape(1, -1)
-        distances, indices = text_vector_store.search(query_text_embedding, k=min(top_k * 2, text_vector_store.ntotal))
+    if text_vector_store is not None:
+        print(f"DEBUG: Text vector store size: {text_vector_store.ntotal}")
+        if text_vector_store.ntotal > 0:
+            query_text_embedding = embedding_model.encode(query, convert_to_tensor=True).cpu().numpy().reshape(1, -1)
+            distances, indices = text_vector_store.search(query_text_embedding, k=min(top_k * 2, text_vector_store.ntotal))
 
-        print(f"DEBUG: Text search found {len(indices[0])} candidates")
-        for i, idx in enumerate(indices[0]):
-            if idx < len(text_metadata):
-                source_path = text_metadata[idx]["source_path"]
-                raw_distance = distances[0][i]
-                score = normalize_score(raw_distance, "text_faiss")
-                
-                modality = "text"
-                if source_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    modality = "image"
-                elif source_path.lower().endswith(('.mp3', '.wav', '.m4a')):
-                    modality = "audio"
+            print(f"DEBUG: Text search found {len(indices[0])} candidates")
+            for i, idx in enumerate(indices[0]):
+                if idx < len(text_metadata):
+                    source_path = text_metadata[idx]["source_path"]
+                    raw_distance = distances[0][i]
+                    score = normalize_score(raw_distance, "text_faiss")
 
-                boost = modality_boosts.get(modality, 1.0)
-                boosted_score = score * boost
+                    modality = "text"
+                    if source_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        modality = "image"
+                    elif source_path.lower().endswith(('.mp3', '.wav', '.m4a')):
+                        modality = "audio"
 
-                all_candidates.append({
-                    "source": source_path,
-                    "text": text_metadata[idx]["text"],
-                    "text_score": boosted_score,
-                    "type": "text" if modality != "image" else "image_description",
-                    "modality": modality
-                })
+                    boost = modality_boosts.get(modality, 1.0)
+                    boosted_score = score * boost
+
+                    all_candidates.append({
+                        "source": source_path,
+                        "text": text_metadata[idx]["text"],
+                        "text_score": boosted_score,
+                        "type": "text" if modality != "image" else "image_description",
+                        "modality": modality
+                    })
+        else:
+            print("DEBUG: Text vector store is empty")
+    else:
+        print("DEBUG: Text vector store is not initialized")
 
     # 3. RE-RANK USING CROSS-ENCODER (for text content)
     text_candidates = [c for c in all_candidates if c.get("text", "").strip()]
@@ -411,7 +627,7 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
 
     if reset_db.lower() == "true":
         # Reset the vector stores
-        if hasattr(text_vector_store, 'reset'):
+        if text_vector_store is not None and hasattr(text_vector_store, 'reset'):
             text_vector_store.reset()
         text_metadata = []
 
@@ -419,7 +635,7 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
     processed_files = 0
 
     for file_obj in files:
-        file_name = file_obj.filename
+        file_name = file_obj.filename or f"temp_file_{id(file_obj)}"
         saved_path = os.path.join(UPLOAD_DIR, file_name)
         with open(saved_path, "wb") as f_out:
             f_out.write(await file_obj.read())
@@ -542,20 +758,28 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
         texts = [c['text'] for c in all_text_chunks]
         text_embeddings = embedding_model.encode(texts, convert_to_tensor=True, show_progress_bar=True).cpu().numpy()
 
-        # Train the FAISS index if it's not trained (with safe training)
-        if not text_vector_store.is_trained:
+        # Initialize or update the vector store if needed
+        if text_vector_store is None or (reset_db.lower() == "true" and len(text_metadata) == 0):
+            # Choose appropriate index type based on number of chunks
+            text_vector_store, _ = choose_index_type(len(all_text_chunks), text_embedding_dim)
+
+        # Train the FAISS index if it's not trained and it's an IVF index
+        if hasattr(text_vector_store, 'is_trained') and not text_vector_store.is_trained:
             training_success = safe_train_index(text_vector_store, text_embeddings)
             if not training_success:
                 # Fallback: Create a new IndexFlatL2 if training fails
                 print("Creating fallback IndexFlatL2 for text storage...")
+                old_store = text_vector_store
                 text_vector_store = faiss.IndexFlatL2(text_embedding_dim)
                 # Re-add any existing embeddings if we're not resetting
-                if text_metadata:
+                if text_metadata and hasattr(old_store, 'ntotal') and old_store.ntotal > 0:
                     print("Warning: Switching to flat index - existing embeddings will be lost. Please re-ingest files.")
 
-        text_vector_store.add(text_embeddings)
-        text_metadata.extend(all_text_chunks)
-        print(f"Added {len(all_text_chunks)} text chunks to the vector store.")
+        # Add embeddings to the vector store
+        if text_vector_store is not None:
+            text_vector_store.add(text_embeddings)
+            text_metadata.extend(all_text_chunks)
+            print(f"Added {len(all_text_chunks)} text chunks to the vector store.")
 
     if not all_text_chunks:
         return {"status": "error", "message": "No valid content extracted."}
@@ -574,78 +798,99 @@ async def chat(payload: ChatRequest):
         return {"answer": "Knowledge base is empty. Please ingest files first."}
 
     try:
-        # 1. JUDGE a subset of top contexts
-        context_for_judgement = "".join(
-            f"[Source: {os.path.basename(ctx[\"source\"])}, Score: {ctx[\"final_score\"]:.2f}]\n{ctx[\"text\"]}\n\n" 
-            for ctx in contexts
-        )
+        # Skip the judge step and directly use all contexts
+        final_contexts = contexts
 
-        judge_messages = [
-            {
-                "role": "system",
-                "content": "You are a judge that selects the most relevant sources to answer a user's query. Respond with a JSON object containing a list of the best source filenames (e.g., {\"best_sources\": [\"source1.pdf\", \"image2.png\"]})."
-            },
-            {
-                "role": "user",
-                "content": f'Given the user query \"{payload.query}\" and the following sources, which are the most relevant?\n\n{context_for_judgement}'
-            }
-        ]
-
-        try:
-            response_content = call_lm_studio_text(judge_messages, model="qwen3-1.7b", max_tokens=200, temperature=0.1)
-            judged_sources_data = json.loads(response_content)
-            judged_source_names = judged_sources_data.get("best_sources", [])
-            
-            # Filter the original contexts to only include the judged ones
-            final_contexts = [ctx for ctx in contexts if os.path.basename(ctx["source"]) in judged_source_names]
-            if not final_contexts:
-                final_contexts = contexts # Fallback to all contexts if judge returns empty
-
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Error parsing judge response: {e}")
-            final_contexts = contexts # Fallback to all contexts
-
-        # 2. GENERATE RESPONSE with the selected contexts
+        # GENERATE RESPONSE with all contexts
         context_str = "\n".join([ctx['text'] for ctx in final_contexts])
         unique_sources = list(set([ctx["source"] for ctx in final_contexts]))
+        
+        # Create a consistent mapping of source paths to citation numbers
+        source_to_citation = {}
+        citation_counter = 1
+        for ctx in final_contexts:
+            source_path = ctx["source"]
+            if source_path not in source_to_citation:
+                source_to_citation[source_path] = citation_counter
+                citation_counter += 1
+        
+        # Create sources list with consistent numbering
         sources_list = []
-        for i, source_path in enumerate(unique_sources, 1):
-            clean_name = os.path.splitext(os.path.basename(source_path))[0]
-            sources_list.append(f'<div class="source-item"><p class="source-name">{clean_name}</p></div>')
+        added_sources = set()
+        for source_path in unique_sources:
+            if source_path not in added_sources:
+                citation_number = source_to_citation[source_path]
+                clean_name = os.path.splitext(os.path.basename(source_path))[0]
+                sources_list.append(f'<div class="source-item"><p class="source-name">{clean_name}</p></div>')
+                added_sources.add(source_path)
         sources_str = "\n".join(sources_list)
 
         messages = [
             {
                 "role": "system",
                 "content": f'''
-                You are a Multimodal RAG agent. Your capabilities include processing and synthesizing information from a diverse range of file types, including text documents, images, and audio transcripts. When formulating a response, you must adhere to the following guidelines:
+                You are a Multimodal RAG agent. Generate responses in VALID HTML format only.
 
-                1.  **Synthesize Information:** Generate a comprehensive and coherent answer based on the provided context. This context may be derived from multiple sources and modalities.
-                2.  **Cite Sources:** For each piece of information drawn from the context, you must provide an inline citation in the format `[1]`, `[2]`, etc. The citation number should correspond to the source file from which the information was extracted.
-                3.  **Format Response:** The entire response must be formatted as HTML. This includes paragraphs, lists, bold and italic text, and any other necessary HTML elements.
-                4.  **Provide a Sources Section:** At the end of your response, include a separator (`--%Sources%--`) followed by a "Sources" section. This section must be enclosed in a `div` with the class `sources-section` and contain a list of the source files used to generate the response.
+**STRICT REQUIREMENTS:**
+1. Respond with COMPLETE HTML document structure
+2. Use proper HTML tags: <p>, <ul>, <li>, <strong>, <em>, etc.
+3. Include citations as [1], [2], etc. within the HTML content
+4. End with --%Sources%-- separator
+5. Follow with proper sources section in HTML format
 
-                Your response should follow this structure:
+**SOURCE SELECTION CRITERIA:**
+- ONLY include sources that directly contribute to answering the user's query
+- If a source is not relevant to the user's question, DO NOT include it in your response
+- It is NOT mandatory to use all provided sources - only use what is necessary
+- The sources provided are candidates detected by algorithms, but you must judge their relevance
 
-                ```html
-                <p>This is a paragraph of the response with a citation.[1] This is another sentence with a citation from a different source.[2]</p>
-                <ul>
-                    <li>This is a list item with a citation.[1]</li>
-                </ul>
-                --%Sources%--
-                <div class="sources-section">
-                  <h3>Sources</h3>
-                  <div class="source-item">
-                    <span class="source-key">1</span>
-                    <span class="source-name">source_name_1</span>
-                  </div>
-                  <div class="source-item">
-                    <span class="source-key">2</span>
-                    <span class="source-name">source_name_2</span>
-                  </div>
-                </div>
-                ```
-                '''
+**CITATION CONSISTENCY REQUIREMENT:**
+- The citation numbers [1], [2], etc. in the content must correspond to the same numbered sources in the sources section below
+- Source [1] in content must match source [1] in the sources section, source [2] must match, etc.
+- The same document must always use the same citation number throughout the response
+
+**RESPONSE STRUCTURE:**
+```html
+<p>Your main content here with citations [1] and proper HTML formatting.</p>
+<p>Multiple paragraphs are allowed.</p>
+<ul>
+    <li>List items with citations [2]</li>
+    <li>More list items</li>
+</ul>
+<p><strong>Bold text</strong> and <em>italic text</em> are allowed.</p>
+--%Sources%--
+<div class="sources-section">
+    <h3>Sources</h3>
+    <div class="source-item">
+        <span class="source-key">1</span>
+        <span class="source-name">source_name_1</span>
+    </div>
+    <div class="source-item">
+        <span class="source-key">2</span>
+        <span class="source-name">source_name_2</span>
+    </div>
+</div>
+```
+
+**CRITICAL:**
+- NO plain text outside HTML tags
+- NO malformed citations like "citation.1"
+- NO text after the sources section
+- ONLY include sources you actually cited in your response
+- Use EXACTLY the source names provided
+- Ensure citation numbers match source numbers (e.g., [1] in content matches [1] in sources)
+- Ensure valid HTML structure
+- The same document must always use the same citation number throughout the response
+
+**EXAMPLES OF INCORRECT RESPONSES TO AVOID:**
+❌ "This is a list item with a citation.1"
+❌ "Sources 1 output"
+❌ Plain text without HTML tags
+❌ Including irrelevant sources that don't contribute to the answer
+
+**EXAMPLES OF CORRECT RESPONSES:**
+✅ "<p>This is properly formatted HTML content [1].</p><p>More content here.</p>--%Sources%--<div class=\"sources-section\"><h3>Sources</h3><div class=\"source-item\"><span class=\"source-key\">1</span><span class=\"source-name\">document.pdf</span></div></div>"
+'''
             },
             {
                 "role": "user",
@@ -653,7 +898,7 @@ async def chat(payload: ChatRequest):
             }
         ]
 
-        final_answer = call_lm_studio_text(messages, model="qwen3-1.7b", max_tokens=1500, temperature=0.7)
+        final_answer = call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=1500, temperature=0.7)
 
         return {
             "answer": final_answer
@@ -672,7 +917,7 @@ async def chat_audio(file: UploadFile = File(...)):
         # Use whisper service for transcription
         try:
             with open(temp_path, 'rb') as audio_file:
-                files = {'file': ('audio.wav', audio_file, 'audio/wav')}
+                files = {'file': audio_file}
                 response = requests.post(WHISPER_SERVICE_URL, files=files)
 
             if response.status_code == 200:
@@ -737,7 +982,7 @@ async def generate_audio(text: str = Form(...), voice: str = Form(default='af_he
 
     try:
         # Initialize the pipeline
-        if not KOKORO_AVAILABLE:
+        if not KOKORO_AVAILABLE or KPipeline is None:
             return {"error": "Kokoro TTS is not available. Please install kokoro."}
         pipeline = KPipeline(lang_code='a')
         # Generate audio from text
@@ -767,7 +1012,7 @@ async def generate_audio(text: str = Form(...), voice: str = Form(default='af_he
 @app.post('/reset')
 def reset():
     global text_vector_store, text_metadata
-    if hasattr(text_vector_store, 'reset'):
+    if text_vector_store is not None and hasattr(text_vector_store, 'reset'):
         text_vector_store.reset()
     text_metadata = []
     return {"status": "ok", "message": "All knowledge bases cleared."}
