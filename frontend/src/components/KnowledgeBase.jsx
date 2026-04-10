@@ -21,10 +21,18 @@ const KnowledgeBase = ({ uploadedFiles, setUploadedFiles, showToast, addMessage 
       return;
     }
 
+    // Only send files that haven't been indexed yet
+    const pendingFiles = uploadedFiles.filter(f => f.status !== 'indexed');
+
+    if (pendingFiles.length === 0) {
+      showToast('All files are already indexed.', 'info');
+      return;
+    }
+
     setIsIndexing(true);
 
     try {
-      const filesToSend = uploadedFiles.map(f => f.file);
+      const filesToSend = pendingFiles.map(f => f.file);
       const result = await api.ingestFiles(filesToSend);
 
       // Check if indexing was successful
@@ -32,16 +40,17 @@ const KnowledgeBase = ({ uploadedFiles, setUploadedFiles, showToast, addMessage 
         throw new Error(result.message);
       }
 
-      // Update status and add timestamp for tracking
+      // Update only the newly indexed files
       const indexedTime = new Date().toLocaleTimeString();
-      setUploadedFiles(prev => prev.map(u => ({
-        ...u,
-        status: 'indexed',
-        indexedAt: indexedTime
-      })));
+      const pendingIds = new Set(pendingFiles.map(f => f.id));
+      setUploadedFiles(prev => prev.map(u => 
+        pendingIds.has(u.id)
+          ? { ...u, status: 'indexed', indexedAt: indexedTime }
+          : u
+      ));
 
-      showToast(`Successfully indexed ${uploadedFiles.length} file(s)`, 'success');
-      addMessage(`✅ Indexed ${uploadedFiles.length} file(s) into the knowledge base. You can now ask questions about your documents.`, false);
+      showToast(`Successfully indexed ${pendingFiles.length} new file(s)`, 'success');
+      addMessage(`✅ Indexed ${pendingFiles.length} new file(s) into the knowledge base. You can now ask questions about your documents.`, false);
     } catch (err) {
       console.error(err);
       showToast(`Indexing failed: ${err.message}`, 'error');

@@ -21,54 +21,54 @@
 ## 🏗 Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         FRONTEND  (React 18)                            │
-│                                                                         │
-│   ┌────────────┐   ┌────────────────┐   ┌──────────────────────────┐   │
-│   │ Knowledge  │   │   AI Chat      │   │    Knowledge Graph       │   │
-│   │ Base Panel │   │   Interface    │   │    Visualization         │   │
-│   │            │   │                │   │                          │   │
-│   │ • Upload   │   │ • Streaming    │   │ • Cytoscape.js           │   │
-│   │ • Index    │   │ • Citations    │   │ • Force-Directed Layout  │   │
-│   │ • Preview  │   │ • Voice I/O   │   │ • Search & Filter        │   │
-│   │ • Stats    │   │ • Read Aloud  │   │ • Interactive Nodes      │   │
-│   └────────────┘   └────────────────┘   └──────────────────────────┘   │
-│                                                                         │
-│                         api.js  (Fetch + SSE)                           │
-└─────────────────────────────┬────────────────────────────────────────────┘
-                              │  HTTP / SSE
-┌─────────────────────────────▼────────────────────────────────────────────┐
-│                      BACKEND  (FastAPI · Python)                         │
-│                                                                          │
-│   ┌──────────────────────────────────────────────────────────────────┐   │
-│   │                      API  Endpoints                              │   │
-│   │  /ingest  ·  /chat-stream  ·  /chat  ·  /knowledge-graph        │   │
-│   │  /transcribe  ·  /generate_audio  ·  /files  ·  /reset          │   │
-│   └──────────────────────────┬───────────────────────────────────────┘   │
-│                              │                                           │
-│   ┌──────────────────────────▼───────────────────────────────────────┐   │
-│   │                     Core RAG Pipeline                             │   │
-│   │                                                                   │   │
-│   │  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌──────────┐ │   │
-│   │  │ Sentence     │  │   FAISS    │  │  Cross-    │  │ LM Studio│ │   │
-│   │  │ Transformer  │  │ Vector DB  │  │  Encoder   │  │  (LLM)   │ │   │
-│   │  │ MiniLM-L6-v2 │  │ L2 / IVF  │  │ Re-Ranker  │  │ Qwen3-4B │ │   │
-│   │  └──────────────┘  └────────────┘  └────────────┘  └──────────┘ │   │
-│   └──────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│   ┌──────────────┐   ┌──────────────┐   ┌────────────────────────────┐  │
-│   │   Whisper    │   │   EasyOCR    │   │   Kokoro TTS               │  │
-│   │  (ASR,5001)  │   │  (Image OCR) │   │  (Text-to-Speech)         │  │
-│   └──────────────┘   └──────────────┘   └────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────────────┘
-                              │  HTTP
-┌─────────────────────────────▼────────────────────────────────────────────┐
-│                     LM STUDIO  (Local LLM Server)                        │
-│                                                                          │
-│    Text Model  :  qwen/qwen3-4b             (Port 1234)                  │
-│    Vision Model:  smolvlm2-500m-video-instruct                           │
-│    API         :  OpenAI-compatible  /v1/chat/completions                │
-└──────────────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------------+
+|                         FRONTEND (React 18)                            |
+|                                                                        |
+|   +--------------+   +----------------+   +--------------------------+ |
+|   | Knowledge    |   | AI Chat        |   | Knowledge Graph          | |
+|   | Base Panel   |   | Interface      |   | Visualization            | |
+|   |              |   |                |   |                          | |
+|   | - Upload     |   | - Streaming    |   | - Cytoscape.js           | |
+|   | - Index      |   | - Citations    |   | - Force-Directed Layout  | |
+|   | - Preview    |   | - Voice I/O    |   | - Search & Filter        | |
+|   | - Stats      |   | - Read Aloud   |   | - Interactive Nodes      | |
+|   +--------------+   +----------------+   +--------------------------+ |
+|                                                                        |
+|                        api.js (Fetch + SSE)                            |
++-----------------------------------+------------------------------------+
+                                    |  HTTP / SSE
++-----------------------------------v------------------------------------+
+|                      BACKEND (FastAPI - Python)                        |
+|                                                                        |
+|   +----------------------------------------------------------------+   |
+|   |                       API Endpoints                            |   |
+|   |  /ingest  /chat-stream  /chat  /knowledge-graph               |   |
+|   |  /transcribe  /generate_audio  /files  /reset                 |   |
+|   +-------------------------------+--------------------------------+   |
+|                                   |                                    |
+|   +-------------------------------v--------------------------------+   |
+|   |                     Core RAG Pipeline                          |   |
+|   |                                                                |   |
+|   |  +--------------+  +------------+  +----------+  +----------+ |   |
+|   |  | Sentence     |  | FAISS      |  | Cross-   |  | LM Studio| |   |
+|   |  | Transformer  |  | Vector DB  |  | Encoder  |  | (LLM)    | |   |
+|   |  | MiniLM-L6-v2 |  | L2 / IVF   |  | Re-Rank  |  | Qwen3-4B | |   |
+|   |  +--------------+  +------------+  +----------+  +----------+ |   |
+|   +----------------------------------------------------------------+   |
+|                                                                        |
+|   +--------------+   +--------------+   +----------------------------+ |
+|   | Whisper      |   | EasyOCR      |   | Kokoro TTS                 | |
+|   | (ASR, 5001)  |   | (Image OCR)  |   | (Text-to-Speech)           | |
+|   +--------------+   +--------------+   +----------------------------+ |
++------------------------------------------------------------------------+
+                                    |  HTTP
++-----------------------------------v------------------------------------+
+|                     LM STUDIO (Local LLM Server)                       |
+|                                                                        |
+|    Text Model  : qwen/qwen3-4b              (Port 1234)               |
+|    Vision Model: smolvlm2-500m-video-instruct                         |
+|    API         : OpenAI-compatible /v1/chat/completions               |
++------------------------------------------------------------------------+
 ```
 
 ---
@@ -78,50 +78,50 @@
 ### 1. Document Ingestion
 
 ```
-User uploads files  →  FileUpload.jsx  →  POST /ingest
-                                              │
-                    ┌─────────────────────────┐│
-                    │   File Type Router      ││
-                    │                         ││
-                    │   .pdf   → pypdf        ││
-                    │   .docx  → python-docx  ││
-                    │   .txt   → UTF-8 read   ││
-                    │   .csv   → pandas       ││
-                    │   .png   → Vision LLM   ││
-                    │   .mp3   → Whisper ASR  ││
-                    └────────────┬────────────┘│
-                                 │
-                                 ▼
+User uploads files --> FileUpload.jsx --> POST /ingest
+                                              |
+                    +-------------------------+
+                    |   File Type Router      |
+                    |                         |
+                    |   .pdf  --> pypdf       |
+                    |   .docx --> python-docx |
+                    |   .txt  --> UTF-8 read  |
+                    |   .csv  --> pandas      |
+                    |   .png  --> Vision LLM  |
+                    |   .mp3  --> Whisper ASR |
+                    +------------+------------+
+                                 |
+                                 v
                     Chunking (400-char, natural breaks)
-                                 │
-                                 ▼
-                    SentenceTransformer → 384-dim embeddings
-                                 │
-                                 ▼
+                                 |
+                                 v
+                    SentenceTransformer --> 384-dim embeddings
+                                 |
+                                 v
                     FAISS Vector Store (FlatL2 / IVFFlat)
 ```
 
 ### 2. Query & Retrieval (RAG)
 
 ```
-User asks a question  →  Chat.jsx  →  POST /chat-stream (SSE)
-                                            │
-                Step 1:  Modality Detection  │  LLM classifies query → boost factor
-                Step 2:  Vector Search       │  FAISS top-k×2 candidates
-                Step 3:  Cross-Encoder       │  Re-rank with ms-marco-MiniLM
-                Step 4:  Score Fusion        │  60% text + 40% cross-encoder
-                Step 5:  Stream Response     │  Top-5 contexts → LLM → SSE tokens
-                                            │
-                                            ▼
+User asks a question --> Chat.jsx --> POST /chat-stream (SSE)
+                                            |
+                Step 1:  Modality Detection  |  LLM classifies query --> boost factor
+                Step 2:  Vector Search       |  FAISS top-k x2 candidates
+                Step 3:  Cross-Encoder       |  Re-rank with ms-marco-MiniLM
+                Step 4:  Score Fusion        |  60% text + 40% cross-encoder
+                Step 5:  Stream Response     |  Top-5 contexts --> LLM --> SSE tokens
+                                            |
+                                            v
                     Chat.jsx renders tokens via requestAnimationFrame
-                    → Citations [1],[2] link to source file previews
+                    --> Citations [1],[2] link to source file previews
 ```
 
 ### 3. Voice Interaction
 
 ```
-Record  🎙️  →  MediaRecorder → POST /transcribe → Whisper → text → RAG pipeline
-Read    🔊  →  AI response   → POST /generate_audio → Kokoro TTS → browser playback
+Record  --> MediaRecorder --> POST /transcribe --> Whisper --> text --> RAG pipeline
+Read    --> AI response   --> POST /generate_audio --> Kokoro TTS --> browser playback
 ```
 
 ---
