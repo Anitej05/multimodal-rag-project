@@ -5,9 +5,10 @@ Combines functionality from main.py and main_hybrid.py
 Preserves all original functionality except LLM inference method
 """
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse, RedirectResponse
+import mammoth
 from typing import List, Optional, Tuple
 import torch
 import faiss
@@ -98,13 +99,21 @@ text_metadata: List[dict] = []  # {"text": str, "source_path": str}
 print("Backend: In-memory Vector DBs initialized.")
 
 # --- LM Studio API Helper Functions ---
-def call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=1000, temperature=0.7):
+# Model configuration - change this to switch models globally
+LM_STUDIO_TEXT_MODEL = "qwen/qwen3-4b"
+
+def call_lm_studio_text(messages, model=None, max_tokens=1000, temperature=0.7):
     """Call LM Studio API for text generation"""
+    if model is None:
+        model = LM_STUDIO_TEXT_MODEL
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": temperature
+        "temperature": temperature,
+        "chat_template_kwargs": {
+            "enable_thinking": False
+        }
     }
 
     try:
@@ -148,6 +157,85 @@ def call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=1000, temper
     except Exception as e:
         print(f"LM Studio text API unexpected error: {e}")
         return ""
+
+def stream_lm_studio_text(messages, model=None, max_tokens=1500, temperature=0.7):
+    """Stream text generation from LM Studio API, yielding SSE-formatted chunks."""
+    if model is None:
+        model = LM_STUDIO_TEXT_MODEL
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,
+        "chat_template_kwargs": {
+            "enable_thinking": False
+        }
+    }
+
+    try:
+        response = requests.post(
+            f"{LM_STUDIO_URL}/v1/chat/completions",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            stream=True
+        )
+        response.raise_for_status()
+
+        inside_think = False
+        think_buffer = ""
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode('utf-8')
+            if not decoded.startswith('data: '):
+                continue
+            data_str = decoded[6:]  # Remove 'data: ' prefix
+            if data_str.strip() == '[DONE]':
+                break  # Don't yield [DONE] here - let the caller control termination
+
+            try:
+                chunk = json.loads(data_str)
+                delta = chunk.get('choices', [{}])[0].get('delta', {})
+                content = delta.get('content', '')
+
+                if not content:
+                    continue
+
+                # Strip <think>...</think> tags on the fly
+                if '<think>' in content:
+                    inside_think = True
+                    think_buffer = ""
+                    # Check if </think> is also in the same chunk
+                    if '</think>' in content:
+                        inside_think = False
+                        content = content.split('</think>', 1)[-1]
+                        if not content:
+                            continue
+                    else:
+                        continue
+
+                if inside_think:
+                    if '</think>' in content:
+                        inside_think = False
+                        content = content.split('</think>', 1)[-1]
+                        if not content:
+                            continue
+                    else:
+                        continue
+
+                # Send the token to the client
+                sse_data = json.dumps({"token": content})
+                yield f"data: {sse_data}\n\n"
+
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+
+    except Exception as e:
+        error_data = json.dumps({"error": str(e)})
+        yield f"data: {error_data}\n\n"
+        yield f"data: [DONE]\n\n"
 
 def call_lm_studio_vision(image_path, query, model="smolvlm2-500m-video-instruct"):
     """Call LM Studio API for vision tasks"""
@@ -336,7 +424,7 @@ def detect_visual_query_qwen(query: str) -> Tuple[bool, float]:
             {"role": "user", "content": f"Analyze this query and determine if it would benefit from image analysis: '{query}'"}
         ]
 
-        response_content = call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=100, temperature=0.1)
+        response_content = call_lm_studio_text(messages, max_tokens=100, temperature=0.1)
 
         # Try to parse JSON response
         try:
@@ -499,7 +587,7 @@ Response format: modality: [modality_name], boost: [number]
     for attempt in range(max_retries):
         try:
             print(f"Modality detection attempt {attempt + 1}/{max_retries}")
-            response_content = call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=100, temperature=0.1)
+            response_content = call_lm_studio_text(messages, max_tokens=100, temperature=0.1)
 
             # Check if response is empty or None
             if not response_content or not response_content.strip():
@@ -821,7 +909,8 @@ async def chat(payload: ChatRequest):
             if source_path not in added_sources:
                 citation_number = source_to_citation[source_path]
                 clean_name = os.path.splitext(os.path.basename(source_path))[0]
-                sources_list.append(f'<div class="source-item"><p class="source-name">{clean_name}</p></div>')
+                actual_filename = os.path.basename(source_path)
+                sources_list.append(f'<div class="source-item" data-filename="{actual_filename}"><p class="source-name">{clean_name}</p></div>')
                 added_sources.add(source_path)
         sources_str = "\n".join(sources_list)
 
@@ -898,7 +987,7 @@ async def chat(payload: ChatRequest):
             }
         ]
 
-        final_answer = call_lm_studio_text(messages, model="qwen/qwen3-4b", max_tokens=1500, temperature=0.7)
+        final_answer = call_lm_studio_text(messages, max_tokens=1500, temperature=0.7)
 
         return {
             "answer": final_answer
@@ -906,6 +995,151 @@ async def chat(payload: ChatRequest):
 
     except Exception as e:
         return {"answer": f"Unexpected error: {e}"}
+
+@app.post("/chat-stream")
+async def chat_stream(payload: ChatRequest):
+    """Streaming chat endpoint - returns Server-Sent Events with token-by-token response."""
+    contexts = retrieve_multimodal_context(payload.query)
+
+    if not contexts:
+        async def empty_stream():
+            yield f"data: {json.dumps({'token': 'Knowledge base is empty. Please ingest files first.'})}\n\n"
+            yield f"data: [DONE]\n\n"
+        return StreamingResponse(empty_stream(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        })
+
+    try:
+        final_contexts = contexts
+        context_str = "\n".join([ctx['text'] for ctx in final_contexts])
+        unique_sources = list(set([ctx["source"] for ctx in final_contexts]))
+
+        # Create citation mapping
+        source_to_citation = {}
+        citation_counter = 1
+        for ctx in final_contexts:
+            source_path = ctx["source"]
+            if source_path not in source_to_citation:
+                source_to_citation[source_path] = citation_counter
+                citation_counter += 1
+
+        # Build sources HTML
+        sources_list = []
+        added_sources = set()
+        for source_path in unique_sources:
+            if source_path not in added_sources:
+                citation_number = source_to_citation[source_path]
+                clean_name = os.path.splitext(os.path.basename(source_path))[0]
+                actual_filename = os.path.basename(source_path)
+                sources_list.append(f'<div class="source-item" data-filename="{actual_filename}"><p class="source-name">{clean_name}</p></div>')
+                added_sources.add(source_path)
+        sources_str = "\n".join(sources_list)
+
+        # Build the sources metadata to send at the end
+        sources_metadata = []
+        added_meta = set()
+        for source_path in unique_sources:
+            if source_path not in added_meta:
+                citation_number = source_to_citation[source_path]
+                clean_name = os.path.splitext(os.path.basename(source_path))[0]
+                actual_filename = os.path.basename(source_path)
+                sources_metadata.append({
+                    "key": citation_number,
+                    "name": clean_name,
+                    "filename": actual_filename
+                })
+                added_meta.add(source_path)
+
+        messages = [
+            {
+                "role": "system",
+                "content": f'''
+                You are a Multimodal RAG agent. Generate responses in VALID HTML format only.
+
+**STRICT REQUIREMENTS:**
+1. Respond with COMPLETE HTML document structure
+2. Use proper HTML tags: <p>, <ul>, <li>, <strong>, <em>, etc.
+3. Include citations as [1], [2], etc. within the HTML content
+4. Do NOT include the sources section - it will be added automatically
+
+**SOURCE SELECTION CRITERIA:**
+- ONLY include sources that directly contribute to answering the user's query
+- Use citation numbers [1], [2], etc. to reference sources
+
+**RESPONSE FORMAT:**
+- Output ONLY the HTML content with citations
+- Do NOT include --%Sources%-- or any sources section
+- Keep it concise and well-formatted
+
+**EXAMPLE:**
+<p>This is properly formatted HTML content [1].</p>
+<p>More content here with another citation [2].</p>
+<ul>
+    <li>List items work too [1]</li>
+</ul>
+'''
+            },
+            {
+                "role": "user",
+                "content": f"CONTEXT:\n{context_str}\n\nUSER'S QUESTION: {payload.query}"
+            }
+        ]
+
+        def generate():
+            # Accumulate the full response to check which sources were actually cited
+            accumulated_text = []
+
+            # Stream the LLM tokens
+            for chunk in stream_lm_studio_text(messages, max_tokens=1500, temperature=0.7):
+                # Filter out any stray [DONE] from inner stream
+                if '[DONE]' in chunk:
+                    continue
+                yield chunk
+
+                # Extract token text from the SSE chunk for accumulation
+                try:
+                    if chunk.startswith('data: '):
+                        token_data = json.loads(chunk[6:].strip())
+                        if 'token' in token_data:
+                            accumulated_text.append(token_data['token'])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            # After streaming is done, check which citations were actually used
+            full_response = ''.join(accumulated_text)
+            cited_numbers = set(re.findall(r'\[(\d+)\]', full_response))
+
+            # Only send sources that were actually cited by the LLM
+            filtered_sources = [
+                src for src in sources_metadata
+                if str(src['key']) in cited_numbers
+            ]
+
+            # If no citations found but we have sources, send all (fallback)
+            if not filtered_sources and sources_metadata:
+                filtered_sources = sources_metadata
+
+            sources_event = json.dumps({"sources": filtered_sources})
+            yield f"data: {sources_event}\n\n"
+            yield f"data: [DONE]\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
+    except Exception as e:
+        async def error_stream():
+            yield f"data: {json.dumps({'token': f'Unexpected error: {e}'})}\n\n"
+            yield f"data: [DONE]\n\n"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
 
 @app.post("/chat-audio")
 async def chat_audio(file: UploadFile = File(...)):
@@ -1009,6 +1243,257 @@ async def generate_audio(text: str = Form(...), voice: str = Form(default='af_he
     except Exception as e:
         return {"error": str(e)}
 
+@app.get('/files')
+def list_files():
+    """List all files in the uploads directory"""
+    files = []
+    if os.path.exists(UPLOAD_DIR):
+        for fname in os.listdir(UPLOAD_DIR):
+            fpath = os.path.join(UPLOAD_DIR, fname)
+            if os.path.isfile(fpath) and not fname.startswith('_temp'):
+                ext = os.path.splitext(fname)[1].lower()
+                file_type = 'document'
+                if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp']:
+                    file_type = 'image'
+                elif ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac']:
+                    file_type = 'audio'
+                elif ext in ['.mp4', '.webm', '.avi', '.mov']:
+                    file_type = 'video'
+                files.append({
+                    "name": fname,
+                    "size": os.path.getsize(fpath),
+                    "type": file_type
+                })
+    return {"files": files}
+
+@app.get('/files/{filename}')
+def get_file(filename: str):
+    """Serve an uploaded file for inline preview in the browser"""
+    # Sanitize the filename to prevent path traversal
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail=f"File '{safe_filename}' not found")
+
+    # Determine media type based on extension
+    ext = os.path.splitext(safe_filename)[1].lower()
+    media_types = {
+        '.pdf': 'application/pdf',
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.doc': 'application/msword',
+        '.txt': 'text/plain',
+        '.csv': 'text/csv',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.bmp': 'image/bmp',
+        '.mp3': 'audio/mpeg',
+        '.wav': 'audio/wav',
+        '.m4a': 'audio/mp4',
+        '.ogg': 'audio/ogg',
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+    }
+    media_type = media_types.get(ext, 'application/octet-stream')
+
+    # Use inline content-disposition so the browser displays the file
+    # instead of downloading it. Do NOT pass filename= to FileResponse
+    # because that sets Content-Disposition: attachment which forces download.
+    response = FileResponse(
+        file_path,
+        media_type=media_type,
+    )
+    # Set inline disposition explicitly
+    response.headers["Content-Disposition"] = f'inline; filename="{safe_filename}"'
+    return response
+
+@app.get('/files/{filename}/preview')
+def preview_file(filename: str):
+    """Preview a file in the browser. Converts DOCX/DOC to HTML for in-browser viewing."""
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail=f"File '{safe_filename}' not found")
+
+    ext = os.path.splitext(safe_filename)[1].lower()
+
+    # For DOCX files, convert to PDF using MS Word for exact rendering
+    if ext in ['.docx', '.doc']:
+        try:
+            import subprocess, sys
+
+            # Create a PDF path next to the original file
+            pdf_filename = os.path.splitext(safe_filename)[0] + '_preview.pdf'
+            pdf_path = os.path.join(UPLOAD_DIR, pdf_filename)
+            abs_file_path = os.path.abspath(file_path)
+            abs_pdf_path = os.path.abspath(pdf_path)
+
+            # Check if a cached PDF already exists and is newer than the DOCX
+            needs_conversion = True
+            if os.path.exists(abs_pdf_path):
+                pdf_mtime = os.path.getmtime(abs_pdf_path)
+                docx_mtime = os.path.getmtime(abs_file_path)
+                if pdf_mtime > docx_mtime:
+                    needs_conversion = False
+                    print(f"Using cached PDF for {safe_filename}")
+
+            if needs_conversion:
+                print(f"Converting {safe_filename} to PDF using MS Word...")
+                # Run in a subprocess because docx2pdf uses COM automation
+                # which doesn't work in uvicorn's async thread context
+                conv_script = (
+                    f'from docx2pdf import convert\n'
+                    f'try:\n'
+                    f'    convert(r"{abs_file_path}", r"{abs_pdf_path}")\n'
+                    f'except AttributeError:\n'
+                    f'    pass  # Known docx2pdf bug at Word.Application.Quit\n'
+                )
+                result = subprocess.run(
+                    [sys.executable, '-c', conv_script],
+                    capture_output=True, text=True, timeout=60
+                )
+                if result.returncode != 0:
+                    print(f"docx2pdf subprocess error: {result.stderr}")
+
+            # Serve the PDF if it was created
+            if os.path.exists(abs_pdf_path) and os.path.getsize(abs_pdf_path) > 0:
+                response = FileResponse(
+                    abs_pdf_path,
+                    media_type='application/pdf',
+                )
+                response.headers["Content-Disposition"] = f'inline; filename="{pdf_filename}"'
+                return response
+            else:
+                raise Exception("PDF conversion produced no output file")
+
+        except Exception as e:
+            print(f"docx2pdf conversion failed for {safe_filename}: {e}")
+            print("Falling back to mammoth HTML conversion...")
+
+            # Fallback: use mammoth for HTML conversion
+            try:
+                with open(file_path, 'rb') as docx_file:
+                    result = mammoth.convert_to_html(docx_file)
+                    html_content = result.value
+
+                full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{safe_filename} — Document Preview</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: 'Inter', system-ui, sans-serif; background: linear-gradient(180deg, #071028, #0f1724); color: #e2e8f0; line-height: 1.7; padding: 0; min-height: 100vh; }}
+        .doc-header {{ position: sticky; top: 0; z-index: 10; background: rgba(7,16,40,0.92); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.06); padding: 16px 32px; display: flex; align-items: center; gap: 12px; }}
+        .doc-icon {{ width: 36px; height: 36px; border-radius: 8px; background: linear-gradient(135deg, #6366f1, #8b5cf6); display: grid; place-items: center; font-size: 16px; }}
+        .doc-title {{ font-size: 15px; font-weight: 700; color: #f1f5f9; }}
+        .doc-badge {{ font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 6px; background: rgba(245,158,11,0.15); color: #fcd34d; text-transform: uppercase; }}
+        .doc-content {{ max-width: 820px; margin: 40px auto; padding: 48px 56px; background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }}
+        .doc-content h1 {{ font-size: 28px; font-weight: 800; color: #f8fafc; margin: 28px 0 16px; }}
+        .doc-content h2 {{ font-size: 22px; font-weight: 700; color: #e2e8f0; margin: 24px 0 12px; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 8px; }}
+        .doc-content h3 {{ font-size: 18px; font-weight: 700; color: #cbd5e1; margin: 20px 0 10px; }}
+        .doc-content p {{ margin: 0 0 14px; font-size: 15px; color: #cbd5e1; }}
+        .doc-content ul, .doc-content ol {{ margin: 12px 0 16px; padding-left: 24px; }}
+        .doc-content li {{ margin-bottom: 6px; font-size: 15px; color: #cbd5e1; }}
+        .doc-content strong {{ color: #f1f5f9; }}
+        .doc-content em {{ color: #a5b4fc; }}
+        .doc-content table {{ width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }}
+        .doc-content th {{ background: rgba(99,102,241,0.1); padding: 10px 14px; text-align: left; font-weight: 700; color: #e2e8f0; border: 1px solid rgba(255,255,255,0.08); }}
+        .doc-content td {{ padding: 10px 14px; border: 1px solid rgba(255,255,255,0.06); color: #cbd5e1; }}
+        .doc-content img {{ max-width: 100%; height: auto; border-radius: 8px; margin: 16px 0; }}
+    </style>
+</head>
+<body>
+    <div class="doc-header"><div class="doc-icon">📄</div><span class="doc-title">{safe_filename}</span><span class="doc-badge">HTML Fallback</span></div>
+    <div class="doc-content">{html_content}</div>
+</body>
+</html>"""
+                return HTMLResponse(content=full_html)
+            except Exception as fallback_err:
+                raise HTTPException(status_code=500, detail=f"Failed to preview document: {str(e)}. Fallback also failed: {str(fallback_err)}")
+
+    # For TXT files, render as HTML with styling
+    elif ext == '.txt':
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                text_content = f.read()
+
+            # Escape HTML and convert line breaks
+            import html
+            escaped = html.escape(text_content)
+            html_lines = escaped.replace('\n', '<br>')
+
+            full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{safe_filename} — Text Preview</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        body {{ font-family: 'JetBrains Mono', monospace; background: linear-gradient(180deg, #071028, #0f1724); color: #cbd5e1; padding: 0; min-height: 100vh; margin: 0; }}
+        .doc-header {{ position: sticky; top: 0; z-index: 10; background: rgba(7,16,40,0.92); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.06); padding: 16px 32px; display: flex; align-items: center; gap: 12px; }}
+        .doc-icon {{ width: 36px; height: 36px; border-radius: 8px; background: linear-gradient(135deg, #10b981, #34d399); display: grid; place-items: center; font-size: 16px; }}
+        .doc-title {{ font-family: 'Inter', sans-serif; font-size: 15px; font-weight: 700; color: #f1f5f9; }}
+        .doc-badge {{ font-family: 'Inter', sans-serif; font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 6px; background: rgba(16,185,129,0.15); color: #6ee7b7; text-transform: uppercase; }}
+        .doc-content {{ max-width: 900px; margin: 40px auto; padding: 36px 44px; background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; font-size: 14px; line-height: 1.8; white-space: pre-wrap; word-wrap: break-word; }}
+    </style>
+</head>
+<body>
+    <div class="doc-header"><div class="doc-icon">📝</div><span class="doc-title">{safe_filename}</span><span class="doc-badge">TXT</span></div>
+    <div class="doc-content">{html_lines}</div>
+</body>
+</html>"""
+            return HTMLResponse(content=full_html)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to preview text file: {str(e)}")
+
+    # For CSV files, render as a styled HTML table
+    elif ext == '.csv':
+        try:
+            df = pd.read_csv(file_path)
+            table_html = df.to_html(index=False, classes='csv-table', border=0)
+
+            full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{safe_filename} — CSV Preview</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {{ font-family: 'Inter', sans-serif; background: linear-gradient(180deg, #071028, #0f1724); color: #e2e8f0; padding: 0; min-height: 100vh; margin: 0; }}
+        .doc-header {{ position: sticky; top: 0; z-index: 10; background: rgba(7,16,40,0.92); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.06); padding: 16px 32px; display: flex; align-items: center; gap: 12px; }}
+        .doc-icon {{ width: 36px; height: 36px; border-radius: 8px; background: linear-gradient(135deg, #f59e0b, #fbbf24); display: grid; place-items: center; font-size: 16px; }}
+        .doc-title {{ font-size: 15px; font-weight: 700; color: #f1f5f9; }}
+        .doc-badge {{ font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 6px; background: rgba(245,158,11,0.15); color: #fcd34d; text-transform: uppercase; }}
+        .doc-content {{ max-width: 1100px; margin: 40px auto; padding: 32px; background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; overflow-x: auto; }}
+        .csv-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        .csv-table th {{ background: rgba(99,102,241,0.12); padding: 10px 14px; text-align: left; font-weight: 700; color: #e2e8f0; border: 1px solid rgba(255,255,255,0.08); position: sticky; top: 0; }}
+        .csv-table td {{ padding: 8px 14px; border: 1px solid rgba(255,255,255,0.05); color: #cbd5e1; }}
+        .csv-table tr:nth-child(even) td {{ background: rgba(255,255,255,0.015); }}
+        .csv-table tr:hover td {{ background: rgba(99,102,241,0.06); }}
+    </style>
+</head>
+<body>
+    <div class="doc-header"><div class="doc-icon">📊</div><span class="doc-title">{safe_filename}</span><span class="doc-badge">CSV</span></div>
+    <div class="doc-content">{table_html}</div>
+</body>
+</html>"""
+            return HTMLResponse(content=full_html)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to preview CSV file: {str(e)}")
+
+    # For all other file types (images, PDFs, audio), redirect to the direct file endpoint
+    else:
+        return RedirectResponse(url=f"/files/{safe_filename}")
+
 @app.post('/reset')
 def reset():
     global text_vector_store, text_metadata
@@ -1016,6 +1501,155 @@ def reset():
         text_vector_store.reset()
     text_metadata = []
     return {"status": "ok", "message": "All knowledge bases cleared."}
+
+@app.get('/knowledge-graph')
+def knowledge_graph():
+    """Build a knowledge graph from the current knowledge base metadata."""
+    nodes = []
+    edges = []
+    seen_sources = {}
+    concept_map = {}  # concept_word -> list of source_ids
+
+    STOP_WORDS = {
+        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'shall', 'can', 'need', 'dare', 'ought',
+        'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+        'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below',
+        'between', 'out', 'off', 'over', 'under', 'again', 'further', 'then',
+        'once', 'and', 'but', 'or', 'nor', 'not', 'so', 'if', 'when', 'what',
+        'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'i', 'me',
+        'my', 'myself', 'we', 'our', 'ours', 'you', 'your', 'he', 'she', 'it',
+        'its', 'they', 'them', 'their', 'each', 'all', 'both', 'few', 'more',
+        'most', 'other', 'some', 'such', 'no', 'only', 'own', 'same', 'than',
+        'too', 'very', 'just', 'because', 'here', 'there', 'where', 'how',
+        'also', 'about', 'up', 'down', 'any', 'every', 'while', 'until',
+    }
+
+    # Hub node
+    nodes.append({
+        "id": "hub-knowledge-base",
+        "label": "Knowledge Base",
+        "type": "hub",
+        "size": 55,
+        "description": f"Central repository with {len(text_metadata)} chunks"
+    })
+
+    # Group metadata by source file
+    source_chunks = {}
+    for meta in text_metadata:
+        src = meta.get("source_path", "unknown")
+        if src not in source_chunks:
+            source_chunks[src] = []
+        source_chunks[src].append(meta.get("text", ""))
+
+    # Create file nodes and chunk nodes
+    file_idx = 0
+    for source_path, chunks in source_chunks.items():
+        fname = os.path.basename(source_path)
+        ext = os.path.splitext(fname)[1].lower()
+        base_name = os.path.splitext(fname)[0]
+
+        # Determine type
+        node_type = "document"
+        if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']:
+            node_type = "image"
+        elif ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac']:
+            node_type = "audio"
+
+        file_size = 0
+        if os.path.exists(source_path):
+            file_size = os.path.getsize(source_path)
+
+        file_node_id = f"file-{file_idx}"
+        seen_sources[source_path] = file_node_id
+
+        nodes.append({
+            "id": file_node_id,
+            "label": base_name,
+            "type": node_type,
+            "size": max(25, min(45, 20 + int(2 * (len(str(file_size)) if file_size else 1)))),
+            "description": f"{fname} ({len(chunks)} chunks, {file_size / 1024:.1f} KB)",
+            "status": "indexed",
+            "fileType": ext[1:].upper() if ext else ""
+        })
+
+        # Connect to hub
+        edges.append({
+            "source": "hub-knowledge-base",
+            "target": file_node_id,
+            "weight": 0.9,
+            "type": "contains"
+        })
+
+        # Create chunk nodes (up to 5 per file to prevent clutter)
+        for c_idx, chunk_text in enumerate(chunks[:5]):
+            chunk_node_id = f"chunk-{file_idx}-{c_idx}"
+            preview = chunk_text[:80].replace("\n", " ").strip()
+            nodes.append({
+                "id": chunk_node_id,
+                "label": f"Chunk {c_idx + 1}",
+                "type": "chunk",
+                "size": 12,
+                "description": f"{preview}..." if len(chunk_text) > 80 else preview
+            })
+            edges.append({
+                "source": file_node_id,
+                "target": chunk_node_id,
+                "weight": 0.7,
+                "type": "chunk_of"
+            })
+
+        # Extract concepts from all chunks for this file
+        word_freq = {}
+        for chunk in chunks:
+            words = re.findall(r'[a-zA-Z]{4,}', chunk.lower())
+            for w in words:
+                if w not in STOP_WORDS:
+                    word_freq[w] = word_freq.get(w, 0) + 1
+
+        # Take top concepts
+        top_concepts = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:5]
+        for word, freq in top_concepts:
+            concept_id = f"concept-{word}"
+            if word not in concept_map:
+                concept_map[word] = []
+                nodes.append({
+                    "id": concept_id,
+                    "label": word.capitalize(),
+                    "type": "concept",
+                    "size": min(28, 14 + freq),
+                    "description": f"Concept: {word} (freq: {freq})"
+                })
+            concept_map[word].append(file_node_id)
+            edges.append({
+                "source": file_node_id,
+                "target": concept_id,
+                "weight": min(1.0, 0.3 + freq * 0.1),
+                "type": "mentions"
+            })
+
+        file_idx += 1
+
+    # Add inter-concept edges for shared source files
+    concept_list = list(concept_map.keys())
+    for i in range(len(concept_list)):
+        for j in range(i + 1, len(concept_list)):
+            shared = set(concept_map[concept_list[i]]) & set(concept_map[concept_list[j]])
+            if shared:
+                edges.append({
+                    "source": f"concept-{concept_list[i]}",
+                    "target": f"concept-{concept_list[j]}",
+                    "weight": min(1.0, 0.2 * len(shared)),
+                    "type": "related"
+                })
+
+    types = set(n["type"] for n in nodes)
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "clusters": len(types)
+    }
 
 if __name__ == '__main__':
     import uvicorn

@@ -25,6 +25,60 @@ const api = {
     return res.json();
   },
 
+  async chatTextStream(query, { onToken, onSources, onDone, onError }) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/chat-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query })
+      });
+      if (!res.ok) throw new Error(`Chat stream failed: ${res.statusText}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const data = trimmed.slice(6); // Remove 'data: '
+
+          if (data === '[DONE]') {
+            if (onDone) onDone();
+            return;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.token && onToken) {
+              onToken(parsed.token);
+            }
+            if (parsed.sources && onSources) {
+              onSources(parsed.sources);
+            }
+            if (parsed.error && onError) {
+              onError(parsed.error);
+            }
+          } catch (e) {
+            // Skip malformed JSON chunks
+          }
+        }
+      }
+      if (onDone) onDone();
+    } catch (err) {
+      if (onError) onError(err.message);
+      throw err;
+    }
+  },
+
   async chatAudio(file) {
     const fd = new FormData();
     fd.append('file', file);
@@ -64,6 +118,22 @@ const api = {
       method: 'POST' 
     });
     if (!res.ok) throw new Error(`Reset failed: ${res.statusText}`);
+    return res.json();
+  },
+
+  getFileUrl(filename) {
+    return `${API_BASE_URL}/files/${encodeURIComponent(filename)}`;
+  },
+
+  getFilePreviewUrl(filename) {
+    // Routes through the preview endpoint which converts DOCX/TXT/CSV to HTML
+    // and redirects images/PDFs to direct serving
+    return `${API_BASE_URL}/files/${encodeURIComponent(filename)}/preview`;
+  },
+
+  async listFiles() {
+    const res = await fetch(`${API_BASE_URL}/files`);
+    if (!res.ok) throw new Error(`List files failed: ${res.statusText}`);
     return res.json();
   }
 };

@@ -1,23 +1,113 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import api from '../services/api';
 import ConfirmDialog from './ConfirmDialog';
 
-const Chat = ({ messages, addMessage, showToast }) => {
+const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToast }) => {
   const [chatInput, setChatInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const [recorder, setRecorder] = useState(null);
   const [isRecording, setIsRecording] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [audio, setAudio] = useState(null);
+  const [availableFiles, setAvailableFiles] = useState([]);
 
   const chatMessagesRef = useRef(null);
   const chatInputRef = useRef(null);
+  const streamBubbleRef = useRef(null);
+  const streamContentRef = useRef(''); // Accumulate tokens without re-render
+  const rafRef = useRef(null);
+
+  // Fetch list of available files so we can match source names to actual filenames
+  useEffect(() => {
+    const fetchFiles = async () => {
+      try {
+        const result = await api.listFiles();
+        if (result.files) {
+          setAvailableFiles(result.files);
+        }
+      } catch (err) {
+        console.log('Could not fetch file list:', err);
+      }
+    };
+    fetchFiles();
+  }, [messages]);
 
   useEffect(() => {
     if (chatMessagesRef.current) {
       chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
     }
-  }, [messages, isTyping]);
+  }, [messages, isTyping, isStreaming]);
+
+  // Auto-scroll during streaming via RAF
+  const scrollToBottom = useCallback(() => {
+    if (chatMessagesRef.current) {
+      chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
+    }
+  }, []);
+
+  // Match a clean source name (without extension) to an actual filename  
+  const findActualFilename = useCallback((cleanName) => {
+    if (!cleanName || !availableFiles.length) return null;
+
+    // First try exact match (with extension)
+    const exactMatch = availableFiles.find(f => f.name === cleanName);
+    if (exactMatch) return exactMatch.name;
+
+    // Try matching without extension
+    const normalizedClean = cleanName.replace(/[_\s]+/g, ' ').toLowerCase().trim();
+    for (const file of availableFiles) {
+      const nameWithoutExt = file.name.replace(/\.[^/.]+$/, '');
+      const normalizedFile = nameWithoutExt.replace(/[_\s]+/g, ' ').toLowerCase().trim();
+      if (normalizedFile === normalizedClean) {
+        return file.name;
+      }
+    }
+
+    // Try partial match
+    for (const file of availableFiles) {
+      const nameWithoutExt = file.name.replace(/\.[^/.]+$/, '');
+      const normalizedFile = nameWithoutExt.replace(/[_\s]+/g, ' ').toLowerCase().trim();
+      if (normalizedFile.includes(normalizedClean) || normalizedClean.includes(normalizedFile)) {
+        return file.name;
+      }
+    }
+
+    return null;
+  }, [availableFiles]);
+
+  // Handle click events on source items using event delegation
+  const handleSourceClick = useCallback((e) => {
+    const sourceItem = e.target.closest('.source-item');
+    if (!sourceItem) return;
+
+    // Prefer the data-filename attribute set by backend (exact filename with extension)
+    let actualFilename = sourceItem.getAttribute('data-filename');
+
+    // Fallback: try fuzzy matching from available files
+    if (!actualFilename) {
+      const sourceName = sourceItem.querySelector('.source-name');
+      if (sourceName) {
+        actualFilename = findActualFilename(sourceName.textContent.trim());
+      }
+    }
+
+    if (actualFilename) {
+      const fileUrl = api.getFilePreviewUrl(actualFilename);
+      window.open(fileUrl, '_blank');
+    } else {
+      showToast('Could not open file', 'error');
+    }
+  }, [findActualFilename, showToast]);
+
+  // Attach click handler to source items via event delegation
+  useEffect(() => {
+    const container = chatMessagesRef.current;
+    if (!container) return;
+
+    container.addEventListener('click', handleSourceClick);
+    return () => container.removeEventListener('click', handleSourceClick);
+  }, [handleSourceClick]);
 
   const sendMessage = async () => {
     const text = chatInput.trim();
@@ -29,21 +119,81 @@ const Chat = ({ messages, addMessage, showToast }) => {
 
     addMessage(text, true, {});
     setChatInput('');
-    if (chatInputRef.current) {
-      chatInputRef.current.style.height = 'auto';
-    }
     
     setIsTyping(true);
+    setIsStreaming(false);
+    streamContentRef.current = '';
+
     try {
-      const res = await api.chatText(text);
-      const messageText = res.answer || res.response || 'No response from assistant';
-      addMessage(messageText, false, {});
+      let sourcesData = null;
+
+      await api.chatTextStream(text, {
+        onToken: (token) => {
+          // First token received — switch from "searching" to streaming
+          if (!streamContentRef.current) {
+            setIsTyping(false);
+            setIsStreaming(true);
+          }
+
+          streamContentRef.current += token;
+
+          // Use requestAnimationFrame for smooth DOM updates
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
+          rafRef.current = requestAnimationFrame(() => {
+            if (streamBubbleRef.current) {
+              streamBubbleRef.current.innerHTML = streamContentRef.current;
+              scrollToBottom();
+            }
+          });
+        },
+        onSources: (data) => {
+          sourcesData = data;
+        },
+        onDone: () => {
+          // Cancel any pending RAF
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
+
+          // Build final message with sources
+          let finalContent = streamContentRef.current;
+          
+          if (sourcesData && sourcesData.length > 0) {
+            // Build sources HTML
+            let sourcesHtml = '<div class="sources-section"><h3>Sources</h3>';
+            sourcesData.forEach(src => {
+              sourcesHtml += `<div class="source-item source-item-clickable" data-filename="${src.filename}"><span class="source-key">${src.key}</span><span class="source-name">${src.name}</span><span class="source-open-icon" title="Click to open file">↗</span></div>`;
+            });
+            sourcesHtml += '</div>';
+            finalContent = `${finalContent}--%Sources%--${sourcesHtml}`;
+          }
+
+          // Commit to React state
+          addMessage(finalContent, false, {});
+          setIsStreaming(false);
+          setIsTyping(false);
+          streamContentRef.current = '';
+        },
+        onError: (err) => {
+          console.error('Stream error:', err);
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
+
+          const errorContent = streamContentRef.current || `❌ Error: ${err}`;
+          addMessage(errorContent, false, {});
+          setIsStreaming(false);
+          setIsTyping(false);
+          streamContentRef.current = '';
+        }
+      });
     } catch (err) {
       console.error(err);
-      addMessage(`❌ Error: ${err.message}`, false, {});
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      
+      if (!streamContentRef.current) {
+        addMessage(`❌ Error: ${err.message}`, false, {});
+      }
       showToast(`Chat failed: ${err.message}`, 'error');
-    } finally {
+      setIsStreaming(false);
       setIsTyping(false);
+      streamContentRef.current = '';
     }
   };
 
@@ -56,8 +206,6 @@ const Chat = ({ messages, addMessage, showToast }) => {
 
   const handleChatInputChange = (e) => {
     setChatInput(e.target.value);
-    e.target.style.height = 'auto';
-    e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
   };
 
   const toggleRecording = async () => {
@@ -87,7 +235,6 @@ const Chat = ({ messages, addMessage, showToast }) => {
         const blob = new Blob(chunks, { type: 'audio/webm' });
         const file = new File([blob], `recording_${Date.now()}.webm`, { type: 'audio/webm' });
         
-        // Transcribe the audio and put it in the input box
         try {
           showToast('Transcribing audio...', 'info');
           const result = await api.transcribeAudio(file);
@@ -144,14 +291,12 @@ const Chat = ({ messages, addMessage, showToast }) => {
       newAudio.onended = () => {
         URL.revokeObjectURL(audioUrl);
         setAudio(null);
-        console.log('Audio playback finished, URL revoked');
       };
 
       newAudio.onerror = () => {
         URL.revokeObjectURL(audioUrl);
         setAudio(null);
         showToast('Error playing audio', 'error');
-        console.log('Audio error occurred, URL revoked');
       };
 
       setAudio(newAudio);
@@ -169,8 +314,8 @@ const Chat = ({ messages, addMessage, showToast }) => {
 
   const handleConfirmClear = () => {
     setShowConfirm(false);
+    clearMessages();
     showToast('Chat cleared', 'info');
-    window.location.reload();
   };
 
   const handleCancelClear = () => {
@@ -189,7 +334,7 @@ const Chat = ({ messages, addMessage, showToast }) => {
 
         <div className="chat-container">
           <div className="chat-messages" ref={chatMessagesRef}>
-            {messages.length === 0 ? (
+            {messages.length === 0 && !isStreaming ? (
               <div className="empty-state">
                 <div className="empty-icon">🤖</div>
                 <div className="empty-text">Start a conversation</div>
@@ -209,45 +354,45 @@ const Chat = ({ messages, addMessage, showToast }) => {
                   // Extract document names from sources HTML for tooltip mapping
                   const documentMap = {};
                   if (sourcesHtml) {
-                    // Parse the sources HTML to map citation numbers to document names
-                    // The sources follow a pattern where we need to extract filename from each source-item
-                    const sourceItemRegex = /<div class="source-item"><p class="source-name">([^<]+)<\/p><\/div>/g;
-                    const sourceItems = sourcesHtml.match(sourceItemRegex) || [];
-
-                    // Assign document names in order of citation numbers
-                    sourceItems.forEach((item, index) => {
-                      const citationNumber = (index + 1).toString();
-                      const nameMatch = item.match(/<p class="source-name">([^<]+)<\/p>/);
-                      if (nameMatch && nameMatch[1]) {
-                        documentMap[citationNumber] = nameMatch[1];
-                      }
-                    });
+                    // Match both <p> and <span> source-name patterns
+                    const sourceItemRegex = /<div class="source-item[^"]*"[^>]*>.*?<(?:p|span) class="source-name">([^<]+)<\/(?:p|span)>.*?<\/div>/gs;
+                    let match;
+                    let index = 0;
+                    while ((match = sourceItemRegex.exec(sourcesHtml)) !== null) {
+                      index++;
+                      documentMap[index.toString()] = match[1];
+                    }
                   }
 
                   // Process the content to wrap plain bracketed citations with styled spans
-                  // Replace [number] with styled span showing only the number
                   let processedContentText = contentText;
-
-                  // Debug: Log the documentMap to see what's being extracted
-                  console.log('DEBUG: documentMap:', documentMap);
-                  console.log('DEBUG: contentText before processing:', contentText);
 
                   processedContentText = processedContentText.replace(/\[([0-9]+)\]/g, function(match, number) {
                     const documentName = documentMap[number] || `Document ${number}`;
-                    console.log(`DEBUG: Citation [${number}] -> Document name: "${documentName}"`);
                     return `<span class="citation" data-source="${number}" data-source-name="${documentName}">${number}</span>`;
                   });
 
-                  console.log('DEBUG: processedContentText after:', processedContentText);
-
-                  // Process sources HTML to remove brackets from citation numbers
+                  // Process sources HTML to remove brackets and add clickable styling
                   if (sourcesHtml) {
-                    // Remove brackets from source-key elements that contain [number] format
-                    const keyRegex = new RegExp('<span class="source-key">\\[([0-9]+)\\]</span>', 'g');
+                    const keyRegex = new RegExp('<span class="source-key">\\[([0-9]+)\\]<\\/span>', 'g');
                     sourcesHtml = sourcesHtml.replace(keyRegex, '<span class="source-key">$1</span>');
+
+                    // Add clickable class to source items (preserve any existing attributes like data-filename)
+                    sourcesHtml = sourcesHtml.replace(
+                      /<div class="source-item"([^>]*)>/g,
+                      '<div class="source-item source-item-clickable"$1>'
+                    );
+
+                    // Add the open icon after each source-name (only if not already present)
+                    if (!sourcesHtml.includes('source-open-icon')) {
+                      sourcesHtml = sourcesHtml.replace(
+                        /(<(?:p|span) class="source-name">([^<]+)<\/(?:p|span)>)/g,
+                        '$1<span class="source-open-icon" title="Click to open file">↗</span>'
+                      );
+                    }
                   }
 
-                  // Comprehensive cleanup: Remove any remaining source markers that might have slipped through
+                  // Cleanup
                   processedContentText = processedContentText.replace(/--%Sources%--/g, '');
                   if (sourcesHtml) {
                     sourcesHtml = sourcesHtml.replace(/--%Sources%--/g, '');
@@ -268,13 +413,25 @@ const Chat = ({ messages, addMessage, showToast }) => {
                     </div>
                   );
                 })}
+
+                {/* Live streaming bubble - renders outside React state for performance */}
+                {isStreaming && (
+                  <div className="message message-assistant">
+                    <div className="message-avatar">🤖</div>
+                    <div className="message-content">
+                      <div className="message-bubble streaming" ref={streamBubbleRef}></div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Searching indicator - shown before first token arrives */}
                 {isTyping && (
                   <div className="message message-assistant">
                     <div className="message-avatar">🤖</div>
                     <div className="message-content">
                       <div className="message-bubble">
                         <span className="loading-spinner"></span>
-                        <span style={{ marginLeft: '8px' }}>Thinking...</span>
+                        <span style={{ marginLeft: '8px' }}>Searching knowledge base...</span>
                       </div>
                     </div>
                   </div>
@@ -285,11 +442,11 @@ const Chat = ({ messages, addMessage, showToast }) => {
 
           <div className="chat-input-container">
             <div className="chat-input-wrapper">
-              <textarea 
+              <input 
                 ref={chatInputRef}
+                type="text"
                 className="chat-input"
                 placeholder="Ask anything about your knowledge base..."
-                rows="1"
                 value={chatInput}
                 onChange={handleChatInputChange}
                 onKeyPress={handleKeyPress}
@@ -298,6 +455,7 @@ const Chat = ({ messages, addMessage, showToast }) => {
                 className="btn btn-primary btn-icon" 
                 onClick={sendMessage}
                 title="Send message"
+                disabled={isTyping || isStreaming}
               >
                 <span>📤</span>
               </button>

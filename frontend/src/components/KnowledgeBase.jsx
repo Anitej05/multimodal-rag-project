@@ -105,14 +105,16 @@ const KnowledgeBase = ({ uploadedFiles, setUploadedFiles, showToast, addMessage 
 
       {/* Upload Tab */}
       {activeTab === 'upload' && (
-        <div style={{ marginTop: '18px' }}>
-          <FileUpload
-            onFilesAdded={handleFilesAdded}
-            uploadedFiles={uploadedFiles}
-            showUploadedFiles={uploadedFiles.some(f => f.status !== 'indexed')}
-          />
-          
-          <StatsCard uploadedFiles={uploadedFiles} />
+        <div className="upload-tab-layout">
+          <div className="upload-tab-scroll">
+            <FileUpload
+              onFilesAdded={handleFilesAdded}
+              uploadedFiles={uploadedFiles}
+              showUploadedFiles={uploadedFiles.some(f => f.status !== 'indexed')}
+            />
+            
+            <StatsCard uploadedFiles={uploadedFiles} />
+          </div>
 
           <div className="controls">
             <button 
