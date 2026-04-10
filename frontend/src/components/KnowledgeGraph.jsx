@@ -32,6 +32,7 @@ const TYPE_LABELS = {
 const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
   const containerRef = useRef(null);
   const cyRef = useRef(null);
+  const layoutRef = useRef(null);
   const [graphData, setGraphData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -209,9 +210,14 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
   const initCytoscape = useCallback(() => {
     if (!containerRef.current || !graphData) return;
 
-    // Destroy previous instance
+    // Stop any running layout and destroy previous instance
+    if (layoutRef.current) {
+      try { layoutRef.current.stop(); } catch (e) { /* already stopped */ }
+      layoutRef.current = null;
+    }
     if (cyRef.current) {
-      cyRef.current.destroy();
+      try { cyRef.current.destroy(); } catch (e) { /* already destroyed */ }
+      cyRef.current = null;
     }
 
     const elements = [];
@@ -426,7 +432,7 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
         },
       ],
 
-      layout: getLayoutConfig(layoutName),
+      layout: { name: 'preset' },
     });
 
     /* ── Interactive: hover ── */
@@ -475,6 +481,11 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
     // Store reference
     cyRef.current = cy;
 
+    // Run layout after cytoscape is fully initialized
+    const layout = cy.layout(getLayoutConfig(layoutName));
+    layoutRef.current = layout;
+    layout.run();
+
     // Update stats
     setStats({
       nodes: graphData.nodes.length,
@@ -493,8 +504,8 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
         name: 'cose-bilkent',
         quality: 'default',
         nodeDimensionsIncludeLabels: true,
-        animate: 'during',
-        animationDuration: 1200,
+        animate: 'end',
+        animationDuration: 800,
         animationEasing: 'ease-out',
         fit: true,
         padding: 60,
@@ -581,7 +592,12 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
   const relayout = useCallback((name) => {
     setLayoutName(name);
     if (!cyRef.current) return;
+    // Stop previous layout before starting new one
+    if (layoutRef.current) {
+      try { layoutRef.current.stop(); } catch (e) { /* already stopped */ }
+    }
     const layout = cyRef.current.layout(getLayoutConfig(name));
+    layoutRef.current = layout;
     layout.run();
   }, []);
 
@@ -632,8 +648,12 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      if (layoutRef.current) {
+        try { layoutRef.current.stop(); } catch (e) { /* already stopped */ }
+        layoutRef.current = null;
+      }
       if (cyRef.current) {
-        cyRef.current.destroy();
+        try { cyRef.current.destroy(); } catch (e) { /* already destroyed */ }
         cyRef.current = null;
       }
     };
