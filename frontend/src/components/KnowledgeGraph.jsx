@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import cytoscape from 'cytoscape';
 import coseBilkent from 'cytoscape-cose-bilkent';
+import api from '../services/api';
 
 // Register the layout extension
 cytoscape.use(coseBilkent);
@@ -12,8 +13,8 @@ const PALETTE = {
   document: { bg: '#6366f1', border: '#818cf8', glow: 'rgba(99,102,241,0.45)' },
   image:    { bg: '#f472b6', border: '#f9a8d4', glow: 'rgba(244,114,182,0.45)' },
   audio:    { bg: '#34d399', border: '#6ee7b7', glow: 'rgba(52,211,153,0.45)' },
-  chunk:    { bg: '#94a3b8', border: '#cbd5e1', glow: 'rgba(148,163,184,0.25)' },
   concept:  { bg: '#fbbf24', border: '#fcd34d', glow: 'rgba(251,191,36,0.40)' },
+  entity:   { bg: '#f97316', border: '#fb923c', glow: 'rgba(249,115,22,0.45)' },
   hub:      { bg: '#2563eb', border: '#60a5fa', glow: 'rgba(37,99,235,0.50)' },
 };
 
@@ -21,15 +22,15 @@ const TYPE_LABELS = {
   document: '📄',
   image: '🖼️',
   audio: '🎵',
-  chunk: '◆',
   concept: '💡',
+  entity: '🔗',
   hub: '🌐',
 };
 
 /* ──────────────────────────────
    Main Knowledge Graph Component
    ────────────────────────────── */
-const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
+const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true, isIndexing = false }) => {
   const containerRef = useRef(null);
   const cyRef = useRef(null);
   const layoutRef = useRef(null);
@@ -45,164 +46,26 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
   /* ─────────────────────────
      Fetch graph data from API
      ───────────────────────── */
-  const fetchGraphData = useCallback(async () => {
-    setLoading(true);
+  const fetchGraphData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
-      const res = await fetch('http://127.0.0.1:8000/knowledge-graph');
-      if (!res.ok) throw new Error(`Failed to fetch graph: ${res.statusText}`);
-      const data = await res.json();
-      setGraphData(data);
+      const data = await api.getKnowledgeGraph();
+      // Only update if data has nodes (avoid empty flash)
+      if (data && data.nodes && data.nodes.length > 0) {
+        setGraphData(data);
+      } else if (!silent) {
+        setGraphData(null);
+      }
     } catch (err) {
       console.error('Knowledge graph fetch error:', err);
-      // Generate demo / sample data if backend is unreachable
-      setGraphData(generateSampleData(uploadedFiles));
+      if (!silent) setError('Could not load knowledge graph from backend.');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
-  }, [uploadedFiles]);
-
-  /* ─────────────────────────────────
-     Generate sample data from uploads
-     ───────────────────────────────── */
-  const generateSampleData = useCallback((files) => {
-    const nodes = [];
-    const edges = [];
-
-    // Hub node
-    nodes.push({
-      id: 'hub-knowledge-base',
-      label: 'Knowledge Base',
-      type: 'hub',
-      size: 55,
-      description: 'Central knowledge repository',
-    });
-
-    // Concept nodes extracted from file names
-    const conceptSet = new Set();
-
-    const fileInfos = files.length > 0
-      ? files.map(f => ({
-          name: f.name || f.file?.name || 'unnamed',
-          type: f.file?.type || '',
-          size: f.file?.size || 0,
-          status: f.status || 'pending',
-        }))
-      : [
-          { name: 'research_paper.pdf', type: 'application/pdf', size: 2048000, status: 'indexed' },
-          { name: 'architecture_diagram.png', type: 'image/png', size: 512000, status: 'indexed' },
-          { name: 'meeting_notes.docx', type: 'application/docx', size: 128000, status: 'indexed' },
-          { name: 'quarterly_data.csv', type: 'text/csv', size: 64000, status: 'indexed' },
-          { name: 'interview_recording.mp3', type: 'audio/mpeg', size: 4096000, status: 'indexed' },
-          { name: 'project_plan.pdf', type: 'application/pdf', size: 1024000, status: 'indexed' },
-          { name: 'system_design.png', type: 'image/png', size: 768000, status: 'indexed' },
-          { name: 'user_feedback.txt', type: 'text/plain', size: 32000, status: 'indexed' },
-        ];
-
-    fileInfos.forEach((file, idx) => {
-      const ext = file.name.split('.').pop().toLowerCase();
-      let nodeType = 'document';
-      if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ext)) nodeType = 'image';
-      else if (['mp3', 'wav', 'm4a', 'ogg', 'flac'].includes(ext)) nodeType = 'audio';
-
-      const nodeId = `file-${idx}`;
-      const baseName = file.name.replace(/\.[^/.]+$/, '');
-
-      nodes.push({
-        id: nodeId,
-        label: baseName,
-        type: nodeType,
-        size: Math.max(25, Math.min(45, 20 + Math.log2(file.size + 1) * 2)),
-        description: `${file.name} (${(file.size / 1024).toFixed(1)} KB)`,
-        status: file.status,
-        fileType: ext.toUpperCase(),
-      });
-
-      // Connect to hub
-      edges.push({
-        source: 'hub-knowledge-base',
-        target: nodeId,
-        weight: 0.9,
-        type: 'contains',
-      });
-
-      // Extract concepts from file name
-      const words = baseName
-        .replace(/[_\-\.]/g, ' ')
-        .split(' ')
-        .filter(w => w.length > 3)
-        .map(w => w.toLowerCase());
-
-      words.forEach(word => {
-        const conceptId = `concept-${word}`;
-        if (!conceptSet.has(word)) {
-          conceptSet.add(word);
-          nodes.push({
-            id: conceptId,
-            label: word.charAt(0).toUpperCase() + word.slice(1),
-            type: 'concept',
-            size: 18,
-            description: `Concept: ${word}`,
-          });
-        }
-        edges.push({
-          source: nodeId,
-          target: conceptId,
-          weight: 0.5,
-          type: 'mentions',
-        });
-      });
-
-      // Generate synthetic chunk nodes
-      const chunkCount = Math.max(1, Math.floor(Math.random() * 3) + 1);
-      for (let c = 0; c < chunkCount; c++) {
-        const chunkId = `chunk-${idx}-${c}`;
-        nodes.push({
-          id: chunkId,
-          label: `Chunk ${c + 1}`,
-          type: 'chunk',
-          size: 12,
-          description: `Text chunk ${c + 1} from ${file.name}`,
-        });
-        edges.push({
-          source: nodeId,
-          target: chunkId,
-          weight: 0.7,
-          type: 'chunk_of',
-        });
-      }
-    });
-
-    // Add inter-concept edges for concepts that share files
-    const conceptFiles = {};
-    edges.forEach(e => {
-      if (e.type === 'mentions') {
-        if (!conceptFiles[e.target]) conceptFiles[e.target] = new Set();
-        conceptFiles[e.target].add(e.source);
-      }
-    });
-
-    const conceptArr = Object.keys(conceptFiles);
-    for (let i = 0; i < conceptArr.length; i++) {
-      for (let j = i + 1; j < conceptArr.length; j++) {
-        const shared = [...conceptFiles[conceptArr[i]]]
-          .filter(f => conceptFiles[conceptArr[j]].has(f));
-        if (shared.length > 0) {
-          edges.push({
-            source: conceptArr[i],
-            target: conceptArr[j],
-            weight: 0.3 * shared.length,
-            type: 'related',
-          });
-        }
-      }
-    }
-
-    // Count clusters (unique types)
-    const types = new Set(nodes.map(n => n.type));
-
-    return { nodes, edges, clusters: types.size };
   }, []);
+
+  /* No more fake data — graph comes from backend LLM extraction */
 
   /* ────────────────────────
      Initialize Cytoscape
@@ -316,17 +179,14 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
             'text-outline-width': 1.5,
           },
         },
-        /* ── Chunk node ── */
+        /* ── Entity node ── */
         {
-          selector: 'node[type="chunk"]',
+          selector: 'node[type="entity"]',
           style: {
-            'shape': 'round-rectangle',
-            'font-size': '7px',
-            'opacity': 0.7,
-            'text-opacity': 0.6,
-            'label': '',
-            'border-width': 1,
-            'shadow-opacity': 0.3,
+            'shape': 'round-hexagon',
+            'font-size': '9px',
+            'text-outline-width': 1.5,
+            'border-width': 2,
           },
         },
         /* ── Highlighted node ── */
@@ -335,7 +195,8 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
           style: {
             'border-width': 4,
             'border-color': '#ffffff',
-            'shadow-blur': 35,
+            'shadow-blur': 40,
+            'shadow-color': '#ffffff',
             'shadow-opacity': 1,
             'z-index': 999,
           },
@@ -354,8 +215,8 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
         {
           selector: 'node.faded',
           style: {
-            'opacity': 0.15,
-            'text-opacity': 0.1,
+            'opacity': 0.05,
+            'text-opacity': 0,
             'shadow-opacity': 0,
           },
         },
@@ -411,14 +272,35 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
             'width': 1.5,
           },
         },
+        /* ── "has_entity" edges ── */
+        {
+          selector: 'edge[edgeType="has_entity"]',
+          style: {
+            'line-color': 'rgba(249,115,22,0.25)',
+            'width': 1.5,
+            'line-style': 'solid',
+          },
+        },
+        /* ── "related_to" edges ── */
+        {
+          selector: 'edge[edgeType="related_to"]',
+          style: {
+            'line-color': 'rgba(168,85,247,0.3)',
+            'width': 2,
+            'line-style': 'solid',
+            'target-arrow-shape': 'triangle',
+            'target-arrow-color': 'rgba(168,85,247,0.3)',
+            'arrow-scale': 0.8,
+          },
+        },
         /* ── Highlighted edge ── */
         {
           selector: 'edge.highlighted',
           style: {
-            'line-color': 'rgba(255,255,255,0.6)',
+            'line-color': '#3b82f6', /* Bright primary blue */
             'opacity': 1,
             'width': function(el) {
-              return Math.max(1.5, el.data('weight') * 3.5);
+              return Math.max(3, el.data('weight') * 5);
             },
             'z-index': 999,
           },
@@ -427,7 +309,7 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
         {
           selector: 'edge.faded',
           style: {
-            'opacity': 0.05,
+            'opacity': 0.02,
           },
         },
       ],
@@ -637,9 +519,17 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
     if (isVisible) fetchGraphData();
   }, [isVisible, fetchGraphData]);
 
+  // Auto-refresh during indexing
+  useEffect(() => {
+    if (!isVisible || !isIndexing) return;
+    const interval = setInterval(() => {
+      fetchGraphData(true); // silent refresh
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [isVisible, isIndexing, fetchGraphData]);
+
   useEffect(() => {
     if (isVisible && graphData) {
-      // Small delay to let the DOM update
       const timer = setTimeout(initCytoscape, 100);
       return () => clearTimeout(timer);
     }
@@ -750,6 +640,21 @@ const KnowledgeGraph = ({ uploadedFiles = [], isVisible = true }) => {
           <div className="kg-loading-overlay">
             <div className="kg-loading-spinner" />
             <p>Mapping knowledge connections...</p>
+          </div>
+        )}
+
+        {!loading && !graphData && !error && (
+          <div className="kg-loading-overlay">
+            <span style={{ fontSize: '48px', marginBottom: '16px' }}>🕸️</span>
+            <p style={{ fontSize: '15px', fontWeight: 600 }}>No knowledge graph yet</p>
+            <p style={{ fontSize: '13px', opacity: 0.6 }}>Upload and index files to generate a meaningful knowledge graph with LLM-extracted entities and relationships.</p>
+          </div>
+        )}
+
+        {isIndexing && graphData && (
+          <div className="kg-indexing-indicator">
+            <span className="loading-spinner"></span>
+            <span>Graph updating — extracting entities...</span>
           </div>
         )}
 

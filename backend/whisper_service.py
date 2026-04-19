@@ -1,4 +1,4 @@
-# backend/services/whisper_service.py
+# backend/whisper_service.py — loads Whisper from local models/ directory
 
 import torch
 from fastapi import FastAPI, File, UploadFile
@@ -10,16 +10,18 @@ import uvicorn
 warnings.filterwarnings("ignore")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-COMPUTE_TYPE = "float16" if torch.cuda.is_available() else "int8"
+COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+WHISPER_MODEL_PATH = os.path.join(MODELS_DIR, "faster-whisper-base")
+
 print(f"Whisper Service: Using device '{DEVICE}' with compute type '{COMPUTE_TYPE}'.")
+print(f"Whisper Service: Loading model from {WHISPER_MODEL_PATH}")
 
 app = FastAPI()
 
-print("Whisper Service: Loading Whisper model...")
 try:
-    model_size = "base"
-    audio_transcriber = WhisperModel(model_size, device=DEVICE, compute_type=COMPUTE_TYPE)
-    print("Whisper Service: Model loaded successfully.")
+    audio_transcriber = WhisperModel(WHISPER_MODEL_PATH, device=DEVICE, compute_type=COMPUTE_TYPE)
+    print("Whisper Service: Model loaded successfully from local path.")
 except Exception as e:
     print(f"Whisper Service: Error loading model: {e}")
     audio_transcriber = None
@@ -30,7 +32,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
     if not audio_transcriber:
         return {"error": "Model not loaded"}
 
-    temp_path = "temp_audio_file.wav"
+    temp_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp_audio_file.wav")
     try:
         with open(temp_path, "wb") as buffer:
             buffer.write(await file.read())
@@ -46,7 +48,3 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
 if __name__ == '__main__':
     uvicorn.run(app, host='0.0.0.0', port=5001)
-
-
-
-

@@ -30,6 +30,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [toast, setToast] = useState(null);
   const [activeView, setActiveView] = useState('chat'); // 'chat' or 'graph'
+  const [isIndexing, setIsIndexing] = useState(false);
 
   // Initialize theme state from localStorage or default to light mode
   const [isDarkMode, setIsDarkMode] = useState(() => {
@@ -102,21 +103,23 @@ function App() {
             <line x1="12" y1="15" x2="19" y2="17"/><line x1="12" y1="15" x2="5" y2="17"/>
           </svg>
           <span>Knowledge Graph</span>
+          {isIndexing && <span className="kg-indexing-badge">●</span>}
         </button>
       </div>
 
-      {/* Chat view */}
-      {activeView === 'chat' && (
-        <main className="container">
-          {/* Left Column - Knowledge Base */}
-          <KnowledgeBase
-            uploadedFiles={uploadedFiles}
-            setUploadedFiles={setUploadedFiles}
-            showToast={showToast}
-            addMessage={addMessage}
-          />
+      {/* Main content - KnowledgeBase is always mounted to preserve state */}
+      <main className={`container ${activeView === 'graph' ? 'container-graph' : ''}`}>
+        {/* Left Column - Knowledge Base (always rendered, never unmounts) */}
+        <KnowledgeBase
+          uploadedFiles={uploadedFiles}
+          setUploadedFiles={setUploadedFiles}
+          showToast={showToast}
+          addMessage={addMessage}
+          onIndexingChange={setIsIndexing}
+        />
 
-          {/* Right Column - Chat */}
+        {/* Right Column - switches between Chat and Graph */}
+        {activeView === 'chat' && (
           <Chat
             messages={messages}
             addMessage={addMessage}
@@ -124,27 +127,16 @@ function App() {
             clearMessages={clearMessages}
             showToast={showToast}
           />
-        </main>
-      )}
+        )}
 
-      {/* Graph view */}
-      {activeView === 'graph' && (
-        <main className="container container-graph">
-          {/* Left Column - Knowledge Base */}
-          <KnowledgeBase
-            uploadedFiles={uploadedFiles}
-            setUploadedFiles={setUploadedFiles}
-            showToast={showToast}
-            addMessage={addMessage}
-          />
-
-          {/* Right Column - Knowledge Graph */}
+        {activeView === 'graph' && (
           <KnowledgeGraph
             uploadedFiles={uploadedFiles}
-            isVisible={activeView === 'graph'}
+            isVisible={true}
+            isIndexing={isIndexing}
           />
-        </main>
-      )}
+        )}
+      </main>
 
       {/* Toast Notification */}
       {toast && <Toast message={toast.message} type={toast.type} />}

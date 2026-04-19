@@ -9,10 +9,12 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse, RedirectResponse
 import mammoth
-from typing import List, Optional, Tuple
+from typing import List
+import threading
 import torch
 import faiss
 import os
+import base64
 import warnings
 import requests
 import json
@@ -23,7 +25,6 @@ import subprocess
 import sys
 import atexit
 import numpy as np
-import easyocr
 from PIL import Image
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import pypdf
@@ -45,14 +46,16 @@ warnings.filterwarnings("ignore")
 # --- Configuration ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-WHISPER_SERVICE_URL = "http://127.0.0.1:5001/transcribe"
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+WHISPER_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "faster-whisper-base")
 LM_STUDIO_URL = "http://localhost:1234"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 print(f"Backend: Using device '{DEVICE}'.")
+print(f"Backend: Local models directory: {MODELS_DIR}")
 print(f"Backend: LM Studio endpoint: {LM_STUDIO_URL}")
-print(f"Backend: Whisper service endpoint: {WHISPER_SERVICE_URL}")
+print(f"Backend: Whisper model path: {WHISPER_MODEL_PATH}")
 
 # --- Initialize FastAPI App ---
 app = FastAPI(title="Multimodal RAG Backend with LM Studio")
@@ -64,43 +67,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Load Models ---
-print("Backend: Initializing EasyOCR reader...")
-ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+# --- Load Models (from local models/ directory, GPU-accelerated) ---
+EMB_MODEL_PATH = os.path.join(MODELS_DIR, "qwen3-vl-embedding-2b")
+CE_MODEL_PATH = os.path.join(MODELS_DIR, "cross-encoder-minilm")
 
-print("Backend: Loading text embedding model (all-MiniLM-L6-v2)...")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
+print(f"Backend: Loading embedding model from {EMB_MODEL_PATH}...")
+embedding_model = SentenceTransformer(
+    EMB_MODEL_PATH,
+    device=DEVICE,
+    model_kwargs={"torch_dtype": "bfloat16"},
+)
+print(f"Backend: Embedding model loaded on {DEVICE}. Dim: {embedding_model.get_sentence_embedding_dimension()}")
 
-print("Backend: Loading Cross-encoder for re-ranking...")
-# Try multiple cross-encoder models - fall back if first fails
+print(f"Backend: Loading cross-encoder from {CE_MODEL_PATH}...")
 try:
-    cross_encoder_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', max_length=512)
+    cross_encoder_model = CrossEncoder(CE_MODEL_PATH, max_length=512, device=DEVICE)
+    print(f"Backend: Cross-encoder loaded on {DEVICE}.")
 except Exception as e:
-    print(f"Failed to load primary cross-encoder: {e}")
-    try:
-        cross_encoder_model = CrossEncoder('cross-encoder/ms-marco-TinyBERT-L-2-v2', max_length=512)
-        print("Loaded fallback TinyBERT cross-encoder")
-    except Exception as e2:
-        print(f"Failed to load fallback cross-encoder: {e2}")
-        cross_encoder_model = None
+    print(f"Failed to load cross-encoder: {e}")
+    cross_encoder_model = None
+# --- Load Whisper (in-process, from local models/) ---
+WHISPER_COMPUTE = "float16" if DEVICE == "cuda" else "int8"
+print(f"Backend: Loading Whisper from {WHISPER_MODEL_PATH} on {DEVICE}...")
+try:
+    from faster_whisper import WhisperModel
+    whisper_model = WhisperModel(WHISPER_MODEL_PATH, device=DEVICE, compute_type=WHISPER_COMPUTE)
+    print(f"Backend: Whisper loaded on {DEVICE}.")
+except Exception as e:
+    print(f"Backend: Whisper failed to load: {e}")
+    whisper_model = None
 
 print("Backend: All models loaded.")
 
 # --- Vector Stores (FAISS) ---
 print("Backend: Initializing vector stores...")
-# Text store
-text_embedding_dim = 384
+# Text store (Qwen3-VL-Embedding-2B produces 2048-dim embeddings)
+text_embedding_dim = 2048
 text_vector_store = None  # Will be initialized dynamically
 text_metadata: List[dict] = []  # {"text": str, "source_path": str}
 
 # Image store - REMOVED as we're using text embeddings for images now
 # All content (text and image descriptions) will be stored in the text vector store
 
+# --- Knowledge Graph (LLM-extracted entities & relationships) ---
+knowledge_graph_data = {"nodes": [], "edges": [], "clusters": 0}
+kg_lock = threading.Lock()
+
+# --- Ingestion Status (for async background processing) ---
+ingest_status = {
+    "is_running": False,
+    "total_files": 0,
+    "processed_files": 0,
+    "current_file": "",
+    "phase": "idle",  # idle, embedding, extracting_kg, done, error
+    "message": "",
+    "kg_entities_found": 0,
+}
+ingest_lock = threading.Lock()
+
 print("Backend: In-memory Vector DBs initialized.")
 
 # --- LM Studio API Helper Functions ---
-# Model configuration - change this to switch models globally
-LM_STUDIO_TEXT_MODEL = "qwen/qwen3-4b"
+# Model configuration - Qwen3.5-4B is natively multimodal (text + images)
+LM_STUDIO_TEXT_MODEL = "qwen3.5-4b"
 
 def call_lm_studio_text(messages, model=None, max_tokens=1000, temperature=0.7):
     """Call LM Studio API for text generation"""
@@ -237,53 +266,9 @@ def stream_lm_studio_text(messages, model=None, max_tokens=1500, temperature=0.7
         yield f"data: {error_data}\n\n"
         yield f"data: [DONE]\n\n"
 
-def call_lm_studio_vision(image_path, query, model="smolvlm2-500m-video-instruct"):
-    """Call LM Studio API for vision tasks"""
-    try:
-        # Encode image to base64
-        with open(image_path, 'rb') as img_file:
-            import base64
-            image_b64 = base64.b64encode(img_file.read()).decode('utf-8')
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": query
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_b64}"
-                        }
-                    }
-                ]
-            }
-        ]
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": 300,
-            "temperature": 0.7
-        }
-
-        response = requests.post(
-            f"{LM_STUDIO_URL}/v1/chat/completions",
-            json=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        response.raise_for_status()
-
-        result = response.json()
-        content = result['choices'][0]['message']['content']
-        return content
-
-    except Exception as e:
-        print(f"LM Studio vision API error: {e}")
-        raise
+# NOTE: call_lm_studio_vision() has been removed.
+# Image understanding is now handled natively by Qwen3-VL-Embedding-2B
+# which embeds images directly into the same vector space as text.
 
 # --- FAISS Helper Functions ---
 def calculate_optimal_nlist(n_samples: int) -> int:
@@ -413,270 +398,44 @@ def calculate_final_score(candidate: dict) -> float:
         # If no scores are available, return 0
         return 0.0
 
-def detect_visual_query_qwen(query: str) -> Tuple[bool, float]:
-    """
-    Use Qwen via LM Studio to intelligently detect if a query is visual in nature.
-    Returns (is_visual, confidence_score)
-    """
-    try:
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant that analyzes queries to determine if they would benefit from visual/image analysis. Respond with ONLY a JSON object in this format: {\"is_visual\": true/false, \"confidence\": 0.0-1.0, \"reasoning\": \"brief explanation\"}"},
-            {"role": "user", "content": f"Analyze this query and determine if it would benefit from image analysis: '{query}'"}
-        ]
-
-        response_content = call_lm_studio_text(messages, max_tokens=100, temperature=0.1)
-
-        # Try to parse JSON response
-        try:
-            parsed = json.loads(response_content)
-            return parsed.get("is_visual", False), parsed.get("confidence", 0.0)
-        except json.JSONDecodeError:
-            # Fallback: simple keyword detection if JSON parsing fails
-            visual_keywords = ['image', 'picture', 'photo', 'visual', 'show me', 'describe', 'looks like', 'see', 'view', 'diagram', 'chart', 'graph']
-            query_lower = query.lower()
-            matches = [kw for kw in visual_keywords if kw in query_lower]
-            confidence = min(0.8, len(matches) * 0.2)
-            return len(matches) > 0, confidence
-
-    except Exception as e:
-        print(f"Error in visual query detection: {e}")
-        # Fallback to simple keyword detection
-        visual_keywords = ['image', 'picture', 'photo', 'visual', 'show me', 'describe', 'looks like', 'see', 'view']
-        query_lower = query.lower()
-        matches = [kw for kw in visual_keywords if kw in query_lower]
-        return len(matches) > 0, min(0.7, len(matches) * 0.2)
-
-def parse_simple_format(response_content: str) -> dict:
-    """
-    Parse simple key-value format responses like 'modality: text, boost: 1.2'
-    """
-    if not response_content or not response_content.strip():
-        return {}
-
-    response_content = response_content.strip()
-    
-    # Pattern to match modality: value, boost: value format
-    modality_pattern = r'modality:\s*(\w+)[,\s]*boost:\s*([\d.]+)'
-    match = re.search(modality_pattern, response_content, re.IGNORECASE)
-    
-    if match:
-        modality = match.group(1).lower()
-        boost = float(match.group(2))
-        return {modality: boost}
-    
-    # If modality-boost pattern doesn't match, try to extract any modality/boost values separately
-    modality_match = re.search(r'modality:\s*(\w+)', response_content, re.IGNORECASE)
-    boost_match = re.search(r'boost:\s*([\d.]+)', response_content, re.IGNORECASE)
-    
-    if modality_match and boost_match:
-        modality = modality_match.group(1).lower()
-        boost = float(boost_match.group(1))
-        return {modality: boost}
-    
-    # If we can't find the format, try to extract just the modality if mentioned
-    if 'image' in response_content.lower():
-        return {"image": 1.0}
-    elif 'audio' in response_content.lower():
-        return {"audio": 1.0}
-    else:
-        return {"text": 1.0}  # Default to text if nothing else matches
-
-def parse_sources_format(response_content: str) -> dict:
-    """
-    Parse simple format for sources like 'best_sources: [file1.pdf, file2.pdf]'
-    or 'best_sources: file1.pdf, file2.pdf'
-    """
-    if not response_content or not response_content.strip():
-        return {}
-
-    response_content = response_content.strip()
-    
-    # Pattern to match best_sources: [file1, file2] format
-    sources_pattern = r'best_sources:\s*\[([^\]]+)\]'
-    match = re.search(sources_pattern, response_content, re.IGNORECASE)
-    
-    if match:
-        sources_str = match.group(1)
-        # Split by comma and clean up the filenames
-        sources = [s.strip().strip('"\'') for s in sources_str.split(',')]
-        sources = [s for s in sources if s]  # Remove empty strings
-        return {"best_sources": sources}
-    
-    # Alternative pattern for best_sources: file1, file2 format (without brackets)
-    alt_pattern = r'best_sources:\s*([^\n\r]+)'
-    match = re.search(alt_pattern, response_content, re.IGNORECASE)
-    
-    if match:
-        sources_str = match.group(1)
-        # Split by comma and clean up the filenames
-        sources = [s.strip().strip('"\'') for s in sources_str.split(',')]
-        sources = [s for s in sources if s]  # Remove empty strings
-        return {"best_sources": sources}
-    
-    # If we can't find the specific format, try to extract any filenames we can find
-    # Look for common file extensions in the response
-    filename_pattern = r'[\w\-\s]+\.(pdf|docx|jpg|jpeg|png|txt|csv|wav|mp3|m4a)'
-    found_files = re.findall(filename_pattern, response_content, re.IGNORECASE)
-    if found_files:
-        # We only found the extensions, we need to get the full names
-        # This is a simpler fallback
-        pass
-    
-    return {}  # Return empty dict if no pattern matches
-
-def parse_json_with_retry(response_content: str, max_retries: int = 3) -> dict:
-    """
-    Try to parse JSON response with multiple retry attempts.
-
-    Args:
-        response_content: The response content to parse
-        max_retries: Maximum number of retry attempts
-
-    Returns:
-        dict: Parsed JSON object or empty dict if all retries fail
-    """
-    if not response_content or not response_content.strip():
-        return {}
-
-    response_content = response_content.strip()
-
-    for attempt in range(max_retries):
-        try:
-            return json.loads(response_content)
-        except json.JSONDecodeError as e:
-            print(f"JSON parsing attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                print(f"Retrying... (attempt {attempt + 2}/{max_retries})")
-                # Could add a small delay here if needed
-                continue
-            else:
-                print(f"All {max_retries} JSON parsing attempts failed")
-                # Try to parse in simple format as fallback
-                return parse_simple_format(response_content)
-
-    return {}
-
-def detect_modality(query: str, document_names: List[str]) -> dict:
-    """
-    Detect modality to boost based on user query and available documents.
-    """
-    messages = [
-        {
-            "role": "system",
-            "content": """You are an intelligent assistant that determines which modality to boost for a search. Your options are "text", "image", or "audio". Respond ONLY with the format "modality: [modality_name], boost: [number]"
-
-Examples:
-modality: text, boost: 1.2
-modality: image, boost: 1.5
-modality: audio, boost: 1.3
-
-Response format: modality: [modality_name], boost: [number]
-- Use ONLY the format above, no additional text
-- Choose from: text, image, or audio
-- Boost value should be between 1.0 and 2.0
-- Respond with EXACTLY ONE line in the specified format"""
-        },
-        {
-            "role": "user",
-            "content": f'Given the user query "{query}" and the following documents in the knowledge base: {document_names}, which modality should be boosted?'
-        }
-    ]
-
-    max_retries = 3
-
-    for attempt in range(max_retries):
-        try:
-            print(f"Modality detection attempt {attempt + 1}/{max_retries}")
-            response_content = call_lm_studio_text(messages, max_tokens=100, temperature=0.1)
-
-            # Check if response is empty or None
-            if not response_content or not response_content.strip():
-                print(f"LM Studio returned empty response for modality detection (attempt {attempt + 1})")
-                if attempt == max_retries - 1:
-                    return {"text": 1.0}
-                continue
-
-            # Parse the simple format response
-            parsed = parse_simple_format(response_content)
-
-            if parsed:
-                # Get the first key-value pair from the parsed result
-                for modality, boost in parsed.items():
-                    print(f"Successfully detected modality: {modality} with boost {boost}")
-                    return {modality: boost}
-            else:
-                print(f"Failed to parse response for modality detection (attempt {attempt + 1})")
-                if attempt == max_retries - 1:
-                    print("All modality detection attempts failed, using fallback")
-                    break
-
-        except Exception as e:
-            print(f"Error in modality detection (attempt {attempt + 1}): {e}")
-            if attempt == max_retries - 1:
-                break
-
-    # Fallback to keyword-based detection after all retries failed
-    print("Using keyword-based fallback for modality detection")
-    query_lower = query.lower()
-    if any(ext in query_lower for ext in ['image', 'picture', 'photo', 'visual', 'show me', 'describe', 'looks like', 'see', 'view', 'diagram', 'chart', 'graph']):
-        return {"image": 1.5}
-    elif any(ext in query_lower for ext in ['audio', 'sound', 'listen']):
-        return {"audio": 1.5}
-    else:
-        return {"text": 1.2} # Default to boosting text slightly
 
 def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     """
-    Unified multimodal retrieval that searches across all content types simultaneously.
-    Returns the most relevant content regardless of modality (text, image, audio).
-    All content (text documents and image descriptions) is now in the same text embedding space.
+    Unified multimodal retrieval: vector search + cross-encoder re-ranking.
+    All content (text, images, audio transcriptions) lives in the same embedding space.
     """
     print(f"\n=== DEBUG: retrieve_multimodal_context called with query: {query!r} ===")
 
-    # 1. DETECT MODALITY
-    document_names = [os.path.basename(meta['source_path']) for meta in text_metadata]
-    modality_boosts = detect_modality(query, document_names)
-    print(f"DEBUG: Modality boosts: {modality_boosts}")
-
     all_candidates = []
 
-    # 2. SEARCH TEXT CONTENT (includes text from documents and image descriptions)
+    # 1. VECTOR SEARCH across all content
     if text_vector_store is not None:
-        print(f"DEBUG: Text vector store size: {text_vector_store.ntotal}")
+        print(f"DEBUG: Vector store size: {text_vector_store.ntotal}")
         if text_vector_store.ntotal > 0:
-            query_text_embedding = embedding_model.encode(query, convert_to_tensor=True).cpu().numpy().reshape(1, -1)
-            distances, indices = text_vector_store.search(query_text_embedding, k=min(top_k * 2, text_vector_store.ntotal))
+            query_embedding = embedding_model.encode(query, convert_to_tensor=True).float().cpu().numpy()
+            query_embedding = query_embedding.reshape(1, -1)
+            distances, indices = text_vector_store.search(query_embedding, k=min(top_k * 2, text_vector_store.ntotal))
 
-            print(f"DEBUG: Text search found {len(indices[0])} candidates")
+            print(f"DEBUG: Search found {len(indices[0])} candidates")
             for i, idx in enumerate(indices[0]):
                 if idx < len(text_metadata):
                     source_path = text_metadata[idx]["source_path"]
                     raw_distance = distances[0][i]
                     score = normalize_score(raw_distance, "text_faiss")
 
-                    modality = "text"
-                    if source_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        modality = "image"
-                    elif source_path.lower().endswith(('.mp3', '.wav', '.m4a')):
-                        modality = "audio"
-
-                    boost = modality_boosts.get(modality, 1.0)
-                    boosted_score = score * boost
-
                     all_candidates.append({
                         "source": source_path,
                         "text": text_metadata[idx]["text"],
-                        "text_score": boosted_score,
-                        "type": "text" if modality != "image" else "image_description",
-                        "modality": modality
+                        "text_score": score,
+                        "type": "image" if text_metadata[idx].get("is_image") else "text",
                     })
         else:
-            print("DEBUG: Text vector store is empty")
+            print("DEBUG: Vector store is empty")
     else:
-        print("DEBUG: Text vector store is not initialized")
+        print("DEBUG: Vector store is not initialized")
 
-    # 3. RE-RANK USING CROSS-ENCODER (for text content)
-    text_candidates = [c for c in all_candidates if c.get("text", "").strip()]
+    # 2. RE-RANK with cross-encoder (only for text candidates, not raw images)
+    text_candidates = [c for c in all_candidates if c["type"] == "text" and c.get("text", "").strip()]
     if text_candidates and cross_encoder_model is not None:
         try:
             pairs = [[query, cand["text"]] for cand in text_candidates]
@@ -686,21 +445,488 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
         except Exception as e:
             print(f"DEBUG: Cross-encoder failed: {e}")
 
-    # 4. CALCULATE FINAL SCORES
+    # 3. CALCULATE FINAL SCORES
     for candidate in all_candidates:
         candidate["final_score"] = calculate_final_score(candidate)
 
-    # 5. SORT BY FINAL SCORE
+    # 4. SORT AND RETURN TOP RESULTS
     all_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+    top_results = all_candidates[:top_k]
 
-    # 6. RETURN TOP RESULTS
-    top_results = all_candidates[:5]
-    print(f"DEBUG: Top 5 results:")
+    print(f"DEBUG: Top {len(top_results)} results:")
     for i, result in enumerate(top_results, 1):
         print(f"  {i}. {os.path.basename(result['source'])} (score: {result['final_score']:.3f}, type: {result['type']})")
 
     print("=== END DEBUG: retrieve_multimodal_context ===\n")
     return top_results
+
+# --- Multimodal Message Builder ---
+def build_chat_messages(query: str, contexts: list, system_prompt: str) -> list:
+    """
+    Build LM Studio chat messages with multimodal support.
+    If retrieved contexts include images, they are sent as base64 to Qwen3.5-4B
+    which natively understands both text and images.
+    """
+    # Separate text and image contexts
+    text_parts = []
+    image_parts = []
+    for ctx in contexts:
+        if ctx.get("type") == "image":
+            source_path = ctx["source"]
+            if os.path.exists(source_path):
+                image_parts.append(source_path)
+        else:
+            text_parts.append(ctx["text"])
+
+    context_str = "\n".join(text_parts)
+
+    # Build the user message content
+    user_content = []
+
+    # Add images first so the model can see them
+    for img_path in image_parts:
+        try:
+            with open(img_path, 'rb') as img_file:
+                image_b64 = base64.b64encode(img_file.read()).decode('utf-8')
+            ext = os.path.splitext(img_path)[1].lower()
+            mime = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png'}.get(ext.lstrip('.'), 'image/jpeg')
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{image_b64}"}
+            })
+            print(f"DEBUG: Attached image {os.path.basename(img_path)} to LLM message")
+        except Exception as e:
+            print(f"DEBUG: Failed to attach image {img_path}: {e}")
+
+    # Add the text prompt
+    prompt_text = f"CONTEXT:\n{context_str}\n\nUSER'S QUESTION: {query}" if context_str else f"USER'S QUESTION: {query}"
+    user_content.append({"type": "text", "text": prompt_text})
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+
+    return messages
+
+# --- Knowledge Graph: LLM-based Entity & Relationship Extraction ---
+def extract_entities_from_chunk(chunk_text: str, source_file: str) -> dict:
+    """
+    Use Qwen3.5-4B via LM Studio to extract entities and relationships from a text chunk.
+    Returns {entities: [{name, type}], relationships: [{source, target, relation}]}
+    """
+    if not chunk_text or len(chunk_text.strip()) < 20:
+        return {"entities": [], "relationships": []}
+
+    messages = [
+        {
+            "role": "system",
+            "content": """You are an entity extraction engine. Extract named entities and relationships from the given text.
+
+Return ONLY valid JSON in this exact format (no markdown, no explanation):
+{"entities":[{"name":"Entity Name","type":"person|organization|technology|concept|location|event"}],"relationships":[{"source":"Entity1","target":"Entity2","relation":"relation_description"}]}
+
+Rules:
+- Extract 3-8 important entities per chunk
+- Entity types: person, organization, technology, concept, location, event
+- Only extract clear, meaningful relationships
+- Keep entity names concise (1-4 words)
+- If no clear entities exist, return {"entities":[],"relationships":[]}"""
+        },
+        {
+            "role": "user",
+            "content": f"Extract entities and relationships from this text:\n\n{chunk_text[:800]}"
+        }
+    ]
+
+    try:
+        response = call_lm_studio_text(messages, max_tokens=500, temperature=0.1)
+        if not response or not response.strip():
+            return {"entities": [], "relationships": []}
+
+        # Try to extract JSON from the response
+        response = response.strip()
+
+        # Handle markdown code blocks
+        if response.startswith("```"):
+            lines = response.split("\n")
+            json_lines = []
+            in_block = False
+            for line in lines:
+                if line.startswith("```") and not in_block:
+                    in_block = True
+                    continue
+                elif line.startswith("```") and in_block:
+                    break
+                elif in_block:
+                    json_lines.append(line)
+            response = "\n".join(json_lines)
+
+        # Find JSON object in response
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            json_str = response[start:end]
+            parsed = json.loads(json_str)
+
+            # Validate structure
+            entities = parsed.get("entities", [])
+            relationships = parsed.get("relationships", [])
+
+            # Filter out malformed entries
+            valid_entities = []
+            for e in entities:
+                if isinstance(e, dict) and "name" in e and "type" in e:
+                    e["name"] = str(e["name"]).strip()[:50]
+                    e["type"] = str(e["type"]).lower().strip()
+                    if e["type"] not in {"person", "organization", "technology", "concept", "location", "event"}:
+                        e["type"] = "concept"
+                    if len(e["name"]) > 1:
+                        valid_entities.append(e)
+
+            valid_rels = []
+            entity_names = {e["name"].lower() for e in valid_entities}
+            for r in relationships:
+                if isinstance(r, dict) and "source" in r and "target" in r and "relation" in r:
+                    if r["source"].lower() in entity_names and r["target"].lower() in entity_names:
+                        valid_rels.append(r)
+
+            return {"entities": valid_entities, "relationships": valid_rels}
+
+        return {"entities": [], "relationships": []}
+
+    except Exception as e:
+        print(f"DEBUG: Entity extraction failed for chunk from {source_file}: {e}")
+        return {"entities": [], "relationships": []}
+
+
+def build_knowledge_graph_from_metadata():
+    """
+    Build a rich knowledge graph using multi-layer NLP analysis (NO LLM calls):
+      1. Named entity extraction (regex-based: proper nouns, dates, emails, URLs)
+      2. Keyphrase extraction (bigram/trigram TF-IDF)
+      3. Document similarity from existing FAISS embeddings
+      4. Sentence-level co-occurrence analysis
+      5. Entity type classification via pattern matching
+    """
+    global knowledge_graph_data
+    import math
+    from collections import Counter, defaultdict
+
+    STOP_WORDS = {
+        'the','a','an','is','are','was','were','be','been','being','have','has',
+        'had','do','does','did','will','would','could','should','may','might',
+        'shall','can','need','to','of','in','for','on','with','at','by','from',
+        'as','into','through','during','before','after','above','below','between',
+        'out','off','over','under','again','further','then','once','and','but',
+        'or','nor','not','so','if','when','what','which','who','whom','this',
+        'that','these','those','me','my','myself','our','ours','you','your','he',
+        'she','it','its','they','them','their','each','all','both','few','more',
+        'most','other','some','such','only','own','same','than','too','very',
+        'just','because','here','there','where','how','also','about','up','down',
+        'any','every','while','until','like','using','make','made','many','much',
+        'well','even','still','however','therefore','thus','hence','since',
+        'although','though','whereas','whether','within','without','upon','among',
+        'along','across','behind','beyond','toward','towards','onto','into',
+        'content','information','based','include','including','provide','following',
+        'example','note','type','name','number','first','second','third','last',
+        'next','new','old','good','best','high','low','long','short','large',
+        'small','different','important','available','possible','specific','general',
+        'common','know','think','want','come','take','give','tell','work','call',
+        'look','find','help','show','part','place','case','point','group','need',
+        'turn','start','might','world','area','image','file','document','chunk',
+        'text','data','page','used','must','also','said','says','get','got',
+        'one','two','three','four','five','use','way','see','now','may','will',
+    }
+
+    nodes = []
+    edges = []
+    file_nodes = {}
+    entity_registry = {}     # key -> {id, label, type, sources, count, category}
+    edge_set = set()         # prevent duplicate edges
+
+    def add_edge(src_id, tgt_id, weight, edge_type, label=""):
+        key = f"{src_id}|{tgt_id}|{edge_type}"
+        if key not in edge_set:
+            edge_set.add(key)
+            edges.append({"source": src_id, "target": tgt_id, "weight": weight,
+                          "type": edge_type, "label": label})
+
+    def register_entity(name, category, source_path):
+        key = name.lower().strip()
+        if len(key) < 3 or key in STOP_WORDS:
+            return None
+        if key not in entity_registry:
+            entity_registry[key] = {
+                "id": f"entity-{len(entity_registry)}",
+                "label": name.strip(),
+                "category": category,
+                "sources": set(),
+                "count": 0
+            }
+        entity_registry[key]["sources"].add(source_path)
+        entity_registry[key]["count"] += 1
+        return entity_registry[key]["id"]
+
+    # ── Hub node ──
+    nodes.append({
+        "id": "hub-knowledge-base", "label": "Knowledge Base", "type": "hub",
+        "size": 55, "description": f"Central repository with {len(text_metadata)} indexed items"
+    })
+
+    # ── Group metadata by source file ──
+    source_chunks = {}
+    for meta in text_metadata:
+        src = meta.get("source_path", "unknown")
+        source_chunks.setdefault(src, []).append(meta)
+
+    num_docs = max(len(source_chunks), 1)
+
+    # ══════════════════════════════════════════
+    # LAYER 1: Named Entity Extraction (regex)
+    # ══════════════════════════════════════════
+    # Patterns for different entity types
+    date_pattern = re.compile(r'\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})\b', re.IGNORECASE)
+    email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
+    url_pattern = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+    number_pattern = re.compile(r'\b\d+(?:\.\d+)?(?:\s*(?:%|percent|dollars?|USD|EUR|GBP|INR|kg|km|miles?|hours?|years?|months?|days?|MB|GB|TB))\b', re.IGNORECASE)
+    proper_noun_pattern = re.compile(r'\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+    acronym_pattern = re.compile(r'\b[A-Z]{2,6}\b')
+    tech_pattern = re.compile(r'\b(?:Python|JavaScript|TypeScript|React|Angular|Vue|Node\.?js|Docker|Kubernetes|AWS|Azure|GCP|API|REST|GraphQL|SQL|NoSQL|MongoDB|PostgreSQL|Redis|TensorFlow|PyTorch|CUDA|GPU|CPU|RAM|HTTP|HTTPS|JSON|XML|CSV|HTML|CSS|ML|AI|NLP|LLM|RAG|BERT|GPT|Transformer|FAISS|ONNX)\b', re.IGNORECASE)
+
+    file_texts = {}  # source_path -> full text
+    file_sentences = {}  # source_path -> list of sentences
+
+    for source_path, metas in source_chunks.items():
+        text_metas = [m for m in metas if not m.get("is_image")]
+        full_text = " ".join(m.get("text", "") for m in text_metas)
+        file_texts[source_path] = full_text
+
+        # Split into sentences for co-occurrence
+        sentences = re.split(r'[.!?]+', full_text)
+        file_sentences[source_path] = [s.strip() for s in sentences if len(s.strip()) > 15]
+
+        # Extract proper nouns (multi-word capitalized phrases)
+        for match in proper_noun_pattern.finditer(full_text):
+            name = match.group()
+            if len(name) > 4 and name.lower() not in STOP_WORDS:
+                register_entity(name, "person_or_org", source_path)
+
+        # Extract dates
+        for match in date_pattern.finditer(full_text):
+            register_entity(match.group(), "date", source_path)
+
+        # Extract emails
+        for match in email_pattern.finditer(full_text):
+            register_entity(match.group(), "email", source_path)
+
+        # Extract URLs
+        for match in url_pattern.finditer(full_text):
+            url = match.group()[:50]  # truncate long URLs
+            register_entity(url, "url", source_path)
+
+        # Extract metrics/numbers with units
+        for match in number_pattern.finditer(full_text):
+            register_entity(match.group().strip(), "metric", source_path)
+
+        # Extract technology terms
+        for match in tech_pattern.finditer(full_text):
+            register_entity(match.group(), "technology", source_path)
+
+        # Extract acronyms (but filter common ones)
+        common_acronyms = {'THE','AND','FOR','BUT','NOT','YOU','ALL','CAN','HAD','HER','WAS','ONE','OUR','OUT','HAS','HIS','HOW','ITS','LET','MAY','OLD','SEE','WAY','WHO','BOY','DID','GET','HIM','HIT','HOT','MAN','OIL','SIT','TOP'}
+        for match in acronym_pattern.finditer(full_text):
+            acr = match.group()
+            if acr not in common_acronyms and len(acr) >= 2:
+                register_entity(acr, "acronym", source_path)
+
+    # ══════════════════════════════════════════
+    # LAYER 2: Keyphrase Extraction (bigram TF-IDF)
+    # ══════════════════════════════════════════
+    file_bigrams = {}
+    doc_bigram_freq = Counter()
+
+    for source_path, full_text in file_texts.items():
+        words = re.findall(r'[a-z]+', full_text.lower())
+        filtered = [w for w in words if w not in STOP_WORDS and len(w) > 3]
+
+        # Bigrams
+        bigrams = [f"{filtered[i]} {filtered[i+1]}" for i in range(len(filtered)-1)]
+        bigram_count = Counter(bigrams)
+        # Filter rare bigrams
+        bigram_count = {k: v for k, v in bigram_count.items() if v >= 2}
+        file_bigrams[source_path] = bigram_count
+        for bg in bigram_count:
+            doc_bigram_freq[bg] += 1
+
+    # TF-IDF for bigrams -> top 5 keyphrases per file
+    for source_path, bigram_count in file_bigrams.items():
+        total = sum(bigram_count.values())
+        if total == 0:
+            continue
+        scored = {}
+        for bg, count in bigram_count.items():
+            tf = count / total
+            idf = math.log((num_docs + 1) / (doc_bigram_freq[bg] + 1)) + 1
+            scored[bg] = tf * idf
+        top_phrases = sorted(scored.items(), key=lambda x: x[1], reverse=True)[:5]
+        for phrase, score in top_phrases:
+            register_entity(phrase.title(), "keyphrase", source_path)
+
+    # Also do single-word TF-IDF for top concepts
+    file_word_counts = {}
+    doc_word_freq = Counter()
+    for source_path, full_text in file_texts.items():
+        words = re.findall(r'[a-z]+', full_text.lower())
+        filtered = [w for w in words if w not in STOP_WORDS and len(w) > 4]
+        wc = Counter(filtered)
+        file_word_counts[source_path] = wc
+        for w in wc:
+            doc_word_freq[w] += 1
+
+    for source_path, wc in file_word_counts.items():
+        total = sum(wc.values())
+        if total == 0:
+            continue
+        scored = {}
+        for word, count in wc.items():
+            tf = count / total
+            idf = math.log((num_docs + 1) / (doc_word_freq[word] + 1)) + 1
+            scored[word] = tf * idf
+        top_words = sorted(scored.items(), key=lambda x: x[1], reverse=True)[:6]
+        for word, score in top_words:
+            register_entity(word.capitalize(), "concept", source_path)
+
+    # ══════════════════════════════════════════
+    # LAYER 3: Create File Nodes
+    # ══════════════════════════════════════════
+    file_idx = 0
+    for source_path, metas in source_chunks.items():
+        fname = os.path.basename(source_path)
+        ext = os.path.splitext(fname)[1].lower()
+        base_name = os.path.splitext(fname)[0]
+
+        node_type = "document"
+        if ext in ['.png','.jpg','.jpeg','.gif','.webp','.bmp']:
+            node_type = "image"
+        elif ext in ['.mp3','.wav','.m4a','.ogg','.flac']:
+            node_type = "audio"
+
+        file_size = os.path.getsize(source_path) if os.path.exists(source_path) else 0
+        file_node_id = f"file-{file_idx}"
+        file_nodes[source_path] = file_node_id
+
+        nodes.append({
+            "id": file_node_id, "label": base_name, "type": node_type,
+            "size": max(28, min(45, 22 + int(math.log(max(file_size, 1)) * 1.5))),
+            "description": f"{fname} ({len(metas)} chunks, {file_size/1024:.1f} KB)",
+            "status": "indexed", "fileType": ext[1:].upper() if ext else ""
+        })
+        add_edge("hub-knowledge-base", file_node_id, 0.9, "contains")
+        file_idx += 1
+
+    # ══════════════════════════════════════════
+    # LAYER 4: Create Entity Nodes + Edges
+    # ══════════════════════════════════════════
+    category_to_type = {
+        "person_or_org": "entity", "date": "entity", "email": "entity",
+        "url": "entity", "metric": "entity", "technology": "entity",
+        "acronym": "entity", "keyphrase": "concept", "concept": "concept"
+    }
+    category_icons = {
+        "person_or_org": "👤", "date": "📅", "email": "📧", "url": "🔗",
+        "metric": "📊", "technology": "⚙️", "acronym": "🏷️",
+        "keyphrase": "💡", "concept": "🧠"
+    }
+
+    for key, info in entity_registry.items():
+        node_type = category_to_type.get(info["category"], "concept")
+        icon = category_icons.get(info["category"], "")
+        nodes.append({
+            "id": info["id"],
+            "label": info["label"],
+            "type": node_type,
+            "size": min(35, 12 + info["count"] * 3),
+            "description": f"{icon} {info['category'].replace('_', ' ').title()}: {info['label']} (in {len(info['sources'])} file(s))",
+            "entityType": info["category"]
+        })
+        # Link entity to source files
+        for src_path in info["sources"]:
+            if src_path in file_nodes:
+                add_edge(file_nodes[src_path], info["id"],
+                         min(1.0, 0.3 + info["count"] * 0.1), "has_entity")
+
+    # ══════════════════════════════════════════
+    # LAYER 5: Co-occurrence Edges (entities in same sentence)
+    # ══════════════════════════════════════════
+    for source_path, sentences in file_sentences.items():
+        for sentence in sentences[:30]:  # limit to 30 sentences per file
+            sent_lower = sentence.lower()
+            found_entities = []
+            for key, info in entity_registry.items():
+                if key in sent_lower:
+                    found_entities.append(info["id"])
+            # Connect all pairs found in the same sentence
+            for i in range(len(found_entities)):
+                for j in range(i+1, min(len(found_entities), i+4)):
+                    add_edge(found_entities[i], found_entities[j], 0.5,
+                             "related_to", "co-occurs")
+
+    # ══════════════════════════════════════════
+    # LAYER 6: Document Similarity (from embeddings)
+    # ══════════════════════════════════════════
+    if text_vector_store is not None and text_vector_store.ntotal > 0:
+        file_paths = list(file_nodes.keys())
+        # Get average embedding per file
+        file_avg_embeddings = {}
+        for source_path in file_paths:
+            indices_for_file = [i for i, m in enumerate(text_metadata)
+                                if m.get("source_path") == source_path and i < text_vector_store.ntotal]
+            if indices_for_file:
+                try:
+                    vecs = np.array([text_vector_store.reconstruct(int(idx)) for idx in indices_for_file[:10]])
+                    avg_vec = vecs.mean(axis=0)
+                    norm = np.linalg.norm(avg_vec)
+                    if norm > 0:
+                        file_avg_embeddings[source_path] = avg_vec / norm
+                except Exception:
+                    pass
+
+        # Compute cosine similarity between file pairs
+        paths_with_emb = list(file_avg_embeddings.keys())
+        for i in range(len(paths_with_emb)):
+            for j in range(i+1, len(paths_with_emb)):
+                sim = float(np.dot(file_avg_embeddings[paths_with_emb[i]],
+                                   file_avg_embeddings[paths_with_emb[j]]))
+                if sim > 0.5:  # Only connect similar files
+                    add_edge(file_nodes[paths_with_emb[i]],
+                             file_nodes[paths_with_emb[j]],
+                             sim, "related_to",
+                             f"similar ({sim:.0%})")
+
+    # ── Finalize ──
+    types = set(n["type"] for n in nodes)
+    entity_count = len(entity_registry)
+    categories = Counter(info["category"] for info in entity_registry.values())
+
+    with kg_lock:
+        knowledge_graph_data = {
+            "nodes": nodes,
+            "edges": edges,
+            "clusters": len(types),
+            "stats": {
+                "entities": entity_count,
+                "categories": dict(categories),
+                "files": len(file_nodes)
+            }
+        }
+
+    with ingest_lock:
+        ingest_status["kg_entities_found"] = entity_count
+
+    print(f"Knowledge graph built: {len(nodes)} nodes, {len(edges)} edges, "
+          f"{entity_count} entities across {len(categories)} categories")
+
 
 # --- API Schemas ---
 class ChatRequest(BaseModel):
@@ -709,174 +935,205 @@ class ChatRequest(BaseModel):
 # --- API Endpoints ---
 @app.post("/ingest")
 async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(default="true")):
-    global text_vector_store, text_metadata
+    global text_vector_store, text_metadata, knowledge_graph_data
+
     if not files:
         return {"status": "error", "message": "Please upload files first."}
 
+    # Check if already running
+    with ingest_lock:
+        if ingest_status["is_running"]:
+            return {"status": "error", "message": "Ingestion already in progress. Please wait."}
+
     if reset_db.lower() == "true":
-        # Reset the vector stores
         if text_vector_store is not None and hasattr(text_vector_store, 'reset'):
             text_vector_store.reset()
         text_metadata = []
+        with kg_lock:
+            knowledge_graph_data = {"nodes": [], "edges": [], "clusters": 0}
 
-    all_text_chunks: List[dict] = []
-    processed_files = 0
-
+    # Save all files to disk first (must happen in the async context)
+    saved_files = []
     for file_obj in files:
         file_name = file_obj.filename or f"temp_file_{id(file_obj)}"
         saved_path = os.path.join(UPLOAD_DIR, file_name)
         with open(saved_path, "wb") as f_out:
             f_out.write(await file_obj.read())
+        saved_files.append({"name": file_name, "path": saved_path})
 
+    # Update status
+    with ingest_lock:
+        ingest_status["is_running"] = True
+        ingest_status["total_files"] = len(saved_files)
+        ingest_status["processed_files"] = 0
+        ingest_status["current_file"] = ""
+        ingest_status["phase"] = "embedding"
+        ingest_status["message"] = "Starting ingestion..."
+        ingest_status["kg_entities_found"] = 0
+
+    # Launch background thread for embedding + KG extraction
+    def background_ingest(saved_files_list, should_reset):
+        global text_vector_store, text_metadata
         try:
-            text = ""
-            lower = saved_path.lower()
+            all_text_chunks = []
+            processed = 0
 
-            if lower.endswith((".png", ".jpg", ".jpeg")):
-                # --- Image Processing: Generate description with LM Studio vision model ---
-                img = Image.open(saved_path).convert("RGB")
+            for file_info in saved_files_list:
+                file_name = file_info["name"]
+                saved_path = file_info["path"]
 
-                # Use LM Studio vision model to generate detailed description
+                with ingest_lock:
+                    ingest_status["current_file"] = file_name
+                    ingest_status["message"] = f"Processing {file_name}..."
+
                 try:
-                    print(f"DEBUG: Calling LM Studio vision model for {file_name}")
-                    description = call_lm_studio_vision(
-                        saved_path,
-                        "Describe this image in detail, focusing on all visible elements, objects, people, text, and context. Be comprehensive but concise."
-                    )
+                    text = ""
+                    lower = saved_path.lower()
 
-                    print(f"DEBUG: LM Studio vision description for {file_name}: {description}")
-                    print(f"DEBUG: Description length: {len(description)} characters")
+                    if lower.endswith((".png", ".jpg", ".jpeg")):
+                        # Direct multimodal embedding via Qwen3-VL-Embedding-2B
+                        try:
+                            print(f"DEBUG: Embedding image directly: {file_name}")
+                            img = Image.open(saved_path).convert("RGB")
+                            img_embedding = embedding_model.encode(img, convert_to_tensor=True).float().cpu().numpy()
+                            img_embedding = img_embedding.reshape(1, -1)
 
-                    if description and description.strip():
-                        print(f"SUCCESS: Generated description for {file_name}")
-                        for i, chunk in enumerate(iterative_chunking(description)):
-                            print(f"DEBUG: Chunk {i+1} for {file_name}: {chunk[:100]}...")
+                            if text_vector_store is None:
+                                text_vector_store, _ = choose_index_type(1, text_embedding_dim)
+                                if hasattr(text_vector_store, 'is_trained') and not text_vector_store.is_trained:
+                                    text_vector_store = faiss.IndexFlatL2(text_embedding_dim)
+
+                            text_vector_store.add(img_embedding)
+                            text_metadata.append({
+                                "text": f"[Image: {file_name}]",
+                                "source_path": saved_path,
+                                "is_image": True
+                            })
+                            processed += 1
+                        except Exception as img_error:
+                            print(f"ERROR: Could not embed image {file_name}: {img_error}")
+                        continue
+
+                    elif lower.endswith((".mp3", ".wav", ".m4a")):
+                        try:
+                            if whisper_model is not None:
+                                segments, _ = whisper_model.transcribe(saved_path, beam_size=5)
+                                text = "".join(seg.text for seg in segments)
+                            else:
+                                text = ""
+                                print(f"Whisper model not loaded, skipping audio: {file_name}")
+                        except Exception as e:
+                            print(f"Error transcribing audio {file_name}: {e}")
+                            text = ""
+
+                    elif lower.endswith('.pdf'):
+                        try:
+                            reader = pypdf.PdfReader(saved_path)
+                            text = "\n".join([page.extract_text() for page in reader.pages])
+                        except Exception as e:
+                            print(f"Error reading PDF {file_name}: {e}")
+                            text = ""
+
+                    elif lower.endswith('.docx'):
+                        try:
+                            doc = docx.Document(saved_path)
+                            text = "\n".join([para.text for para in doc.paragraphs])
+                        except Exception as e:
+                            print(f"Error reading DOCX {file_name}: {e}")
+                            text = ""
+
+                    elif lower.endswith('.csv'):
+                        try:
+                            df = pd.read_csv(saved_path)
+                            text = df.to_string()
+                        except Exception as e:
+                            print(f"Error reading CSV {file_name}: {e}")
+                            text = ""
+
+                    elif lower.endswith('.txt'):
+                        try:
+                            with open(saved_path, 'r', encoding='utf-8') as f:
+                                text = f.read()
+                        except Exception as e:
+                            print(f"Error reading TXT {file_name}: {e}")
+                            text = ""
+                    else:
+                        continue
+
+                    if text:
+                        chunks = iterative_chunking(text)
+                        for chunk in chunks:
                             all_text_chunks.append({"text": chunk, "source_path": saved_path})
-                    else:
-                        print(f"WARNING: Empty description for {file_name}")
-
-                except Exception as desc_error:
-                    print(f"ERROR: Could not generate description for {file_name} with LM Studio: {desc_error}")
-                    print(f"DEBUG: Exception type: {type(desc_error).__name__}")
-                    import traceback
-                    print(f"DEBUG: Full traceback: {traceback.format_exc()}")
-
-                processed_files += 1
-                continue
-
-            elif lower.endswith((".mp3", ".wav", ".m4a")):
-                # Use whisper service for audio transcription
-                try:
-                    with open(saved_path, 'rb') as audio_file:
-                        filename = os.path.basename(saved_path) or "audio.wav"
-                        files = {'file': (filename, audio_file, 'audio/wav')}
-                        response = requests.post(WHISPER_SERVICE_URL, files=files)
-
-                    if response.status_code == 200:
-                        result = response.json()
-                        text = result.get('transcription', '')
-                        print(f"Transcribed audio {file_name}: {len(text)} characters")
-                    else:
-                        print(f"Whisper service error for {file_name}: {response.status_code}")
-                        text = ""
+                        processed += 1
 
                 except Exception as e:
-                    print(f"Error transcribing audio {file_name}: {e}")
-                    text = ""
+                    print(f"Error processing {file_name}: {e}")
 
-            elif lower.endswith('.pdf'):
-                print(f"DEBUG: Processing PDF file: {file_name}")
-                try:
-                    reader = pypdf.PdfReader(saved_path)
-                    text = "\n".join([page.extract_text() for page in reader.pages])
-                    print(f"DEBUG: Extracted {len(text)} characters from PDF {file_name}")
-                except Exception as e:
-                    print(f"DEBUG: Error reading PDF {file_name}: {e}")
-                    text = ""
+                with ingest_lock:
+                    ingest_status["processed_files"] = processed
 
-            elif lower.endswith('.docx'):
-                print(f"DEBUG: Processing DOCX file: {file_name}")
-                try:
-                    doc = docx.Document(saved_path)
-                    text = "\n".join([para.text for para in doc.paragraphs])
-                    print(f"DEBUG: Extracted {len(text)} characters from DOCX {file_name}")
-                except Exception as e:
-                    print(f"DEBUG: Error reading DOCX {file_name}: {e}")
-                    text = ""
+            # Batch embed text chunks
+            if all_text_chunks:
+                with ingest_lock:
+                    ingest_status["phase"] = "embedding"
+                    ingest_status["message"] = f"Embedding {len(all_text_chunks)} text chunks..."
 
-            elif lower.endswith('.csv'):
-                print(f"DEBUG: Processing CSV file: {file_name}")
-                try:
-                    df = pd.read_csv(saved_path)
-                    text = df.to_string()
-                    print(f"DEBUG: Extracted {len(text)} characters from CSV {file_name}")
-                except Exception as e:
-                    print(f"DEBUG: Error reading CSV {file_name}: {e}")
-                    text = ""
+                texts = [c['text'] for c in all_text_chunks]
+                text_embeddings = embedding_model.encode(texts, convert_to_tensor=True, show_progress_bar=True).float().cpu().numpy()
 
-            elif lower.endswith('.txt'):
-                print(f"DEBUG: Processing TXT file: {file_name}")
-                try:
-                    with open(saved_path, 'r', encoding='utf-8') as f:
-                        text = f.read()
-                    print(f"DEBUG: Extracted {len(text)} characters from TXT {file_name}")
-                except Exception as e:
-                    print(f"DEBUG: Error reading TXT {file_name}: {e}")
-                    text = ""
-            else:
-                print(f"DEBUG: Skipping unsupported file type: {file_name}")
-                continue
+                if text_vector_store is None or (should_reset and len(text_metadata) == 0):
+                    text_vector_store, _ = choose_index_type(len(all_text_chunks), text_embedding_dim)
 
-            if text:
-                print(f"DEBUG: Creating chunks for {file_name}")
-                chunks = iterative_chunking(text)
-                print(f"DEBUG: Created {len(chunks)} chunks for {file_name}")
-                for i, chunk in enumerate(chunks):
-                    print(f"DEBUG: Chunk {i+1} for {file_name}: {chunk[:100]}...")
-                    all_text_chunks.append({"text": chunk, "source_path": saved_path})
-                processed_files += 1
-                print(f"DEBUG: Successfully processed document: {file_name}")
-            else:
-                print(f"DEBUG: No text content extracted from {file_name}")
+                if hasattr(text_vector_store, 'is_trained') and not text_vector_store.is_trained:
+                    training_success = safe_train_index(text_vector_store, text_embeddings)
+                    if not training_success:
+                        text_vector_store = faiss.IndexFlatL2(text_embedding_dim)
+
+                if text_vector_store is not None:
+                    text_vector_store.add(text_embeddings)
+                    text_metadata.extend(all_text_chunks)
+                    print(f"Added {len(all_text_chunks)} text chunks to the vector store.")
+
+            # Build knowledge graph (LLM entity extraction)
+            with ingest_lock:
+                ingest_status["phase"] = "extracting_kg"
+                ingest_status["message"] = "Building knowledge graph..."
+
+            build_knowledge_graph_from_metadata()
+
+            # Done
+            with ingest_lock:
+                ingest_status["phase"] = "done"
+                ingest_status["message"] = f"Done! {processed} files processed, {len(text_metadata)} chunks indexed."
+                ingest_status["is_running"] = False
+
         except Exception as e:
-            return {"status": "error", "message": f"Error processing {file_name}: {e}"}
+            print(f"Background ingestion error: {e}")
+            import traceback
+            traceback.print_exc()
+            with ingest_lock:
+                ingest_status["phase"] = "error"
+                ingest_status["message"] = f"Error: {e}"
+                ingest_status["is_running"] = False
 
-    # Batch embed and add to the text store
-    if all_text_chunks:
-        texts = [c['text'] for c in all_text_chunks]
-        text_embeddings = embedding_model.encode(texts, convert_to_tensor=True, show_progress_bar=True).cpu().numpy()
-
-        # Initialize or update the vector store if needed
-        if text_vector_store is None or (reset_db.lower() == "true" and len(text_metadata) == 0):
-            # Choose appropriate index type based on number of chunks
-            text_vector_store, _ = choose_index_type(len(all_text_chunks), text_embedding_dim)
-
-        # Train the FAISS index if it's not trained and it's an IVF index
-        if hasattr(text_vector_store, 'is_trained') and not text_vector_store.is_trained:
-            training_success = safe_train_index(text_vector_store, text_embeddings)
-            if not training_success:
-                # Fallback: Create a new IndexFlatL2 if training fails
-                print("Creating fallback IndexFlatL2 for text storage...")
-                old_store = text_vector_store
-                text_vector_store = faiss.IndexFlatL2(text_embedding_dim)
-                # Re-add any existing embeddings if we're not resetting
-                if text_metadata and hasattr(old_store, 'ntotal') and old_store.ntotal > 0:
-                    print("Warning: Switching to flat index - existing embeddings will be lost. Please re-ingest files.")
-
-        # Add embeddings to the vector store
-        if text_vector_store is not None:
-            text_vector_store.add(text_embeddings)
-            text_metadata.extend(all_text_chunks)
-            print(f"Added {len(all_text_chunks)} text chunks to the vector store.")
-
-    if not all_text_chunks:
-        return {"status": "error", "message": "No valid content extracted."}
+    thread = threading.Thread(
+        target=background_ingest,
+        args=(saved_files, reset_db.lower() == "true"),
+        daemon=True
+    )
+    thread.start()
 
     return {
         "status": "ok",
-        "message": f"Processed {processed_files} files.",
+        "message": f"Ingestion started for {len(saved_files)} files. Processing in background.",
         "text_chunks": len(text_metadata)
     }
+
+@app.get("/ingest-status")
+def get_ingest_status():
+    """Return current ingestion progress for frontend polling."""
+    with ingest_lock:
+        return {**ingest_status}
 
 @app.post("/chat")
 async def chat(payload: ChatRequest):
@@ -914,10 +1171,10 @@ async def chat(payload: ChatRequest):
                 added_sources.add(source_path)
         sources_str = "\n".join(sources_list)
 
-        messages = [
-            {
-                "role": "system",
-                "content": f'''
+        messages = build_chat_messages(
+            query=payload.query,
+            contexts=final_contexts,
+            system_prompt=f'''
                 You are a Multimodal RAG agent. Generate responses in VALID HTML format only.
 
 **STRICT REQUIREMENTS:**
@@ -926,6 +1183,7 @@ async def chat(payload: ChatRequest):
 3. Include citations as [1], [2], etc. within the HTML content
 4. End with --%Sources%-- separator
 5. Follow with proper sources section in HTML format
+6. If images are provided, describe and reference them in your response
 
 **SOURCE SELECTION CRITERIA:**
 - ONLY include sources that directly contribute to answering the user's query
@@ -980,12 +1238,14 @@ async def chat(payload: ChatRequest):
 **EXAMPLES OF CORRECT RESPONSES:**
 ✅ "<p>This is properly formatted HTML content [1].</p><p>More content here.</p>--%Sources%--<div class=\"sources-section\"><h3>Sources</h3><div class=\"source-item\"><span class=\"source-key\">1</span><span class=\"source-name\">document.pdf</span></div></div>"
 '''
-            },
-            {
-                "role": "user",
-                "content": f"CONTEXT:\n{context_str}\n\nUSER'S QUESTION: {payload.query}\n\n--%Sources%--\n<div class=\"sources-section\">\n<h3>Sources</h3>\n{sources_str}\n</div>"
-            }
-        ]
+        )
+
+        # Append sources info as a separate text block in the user message
+        # (the images + query are already in the message from build_chat_messages)
+        messages[-1]["content"].append({
+            "type": "text",
+            "text": f"\n\n--%Sources%--\n<div class=\"sources-section\">\n<h3>Sources</h3>\n{sources_str}\n</div>"
+        })
 
         final_answer = call_lm_studio_text(messages, max_tokens=1500, temperature=0.7)
 
@@ -1052,10 +1312,10 @@ async def chat_stream(payload: ChatRequest):
                 })
                 added_meta.add(source_path)
 
-        messages = [
-            {
-                "role": "system",
-                "content": f'''
+        messages = build_chat_messages(
+            query=payload.query,
+            contexts=final_contexts,
+            system_prompt=f'''
                 You are a Multimodal RAG agent. Generate responses in VALID HTML format only.
 
 **STRICT REQUIREMENTS:**
@@ -1063,6 +1323,7 @@ async def chat_stream(payload: ChatRequest):
 2. Use proper HTML tags: <p>, <ul>, <li>, <strong>, <em>, etc.
 3. Include citations as [1], [2], etc. within the HTML content
 4. Do NOT include the sources section - it will be added automatically
+5. If images are provided, describe and reference them in your response
 
 **SOURCE SELECTION CRITERIA:**
 - ONLY include sources that directly contribute to answering the user's query
@@ -1080,12 +1341,7 @@ async def chat_stream(payload: ChatRequest):
     <li>List items work too [1]</li>
 </ul>
 '''
-            },
-            {
-                "role": "user",
-                "content": f"CONTEXT:\n{context_str}\n\nUSER'S QUESTION: {payload.query}"
-            }
-        ]
+        )
 
         def generate():
             # Accumulate the full response to check which sources were actually cited
@@ -1148,18 +1404,12 @@ async def chat_audio(file: UploadFile = File(...)):
         with open(temp_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        # Use whisper service for transcription
+        # Use in-process Whisper model
+        if whisper_model is None:
+            return {"answer": "Whisper model not loaded"}
         try:
-            with open(temp_path, 'rb') as audio_file:
-                files = {'file': audio_file}
-                response = requests.post(WHISPER_SERVICE_URL, files=files)
-
-            if response.status_code == 200:
-                result = response.json()
-                transcribed_query = result.get('transcription', '').strip()
-            else:
-                return {"answer": f"Whisper service error: {response.status_code}"}
-
+            segments, _ = whisper_model.transcribe(temp_path, beam_size=5)
+            transcribed_query = "".join(seg.text for seg in segments).strip()
         except Exception as e:
             return {"answer": f"Error transcribing audio: {e}"}
 
@@ -1187,19 +1437,13 @@ async def transcribe(file: UploadFile = File(...)):
         with open(temp_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        # Use whisper service for transcription
+        # Use in-process Whisper model
+        if whisper_model is None:
+            return {"error": "Whisper model not loaded"}
         try:
-            with open(temp_path, 'rb') as audio_file:
-                files = {'file': audio_file}
-                response = requests.post(WHISPER_SERVICE_URL, files=files)
-
-            if response.status_code == 200:
-                result = response.json()
-                transcription = result.get('transcription', '')
-                return {"transcription": transcription}
-            else:
-                return {"error": f"Whisper service error: {response.status_code}"}
-
+            segments, _ = whisper_model.transcribe(temp_path, beam_size=5)
+            transcription = "".join(seg.text for seg in segments)
+            return {"transcription": transcription}
         except Exception as e:
             return {"error": f"Error in transcription: {e}"}
 
@@ -1218,7 +1462,8 @@ async def generate_audio(text: str = Form(...), voice: str = Form(default='af_he
         # Initialize the pipeline
         if not KOKORO_AVAILABLE or KPipeline is None:
             return {"error": "Kokoro TTS is not available. Please install kokoro."}
-        pipeline = KPipeline(lang_code='a')
+        kokoro_path = os.path.join(MODELS_DIR, 'kokoro-82m')
+        pipeline = KPipeline(lang_code='a', repo_id=kokoro_path, device=DEVICE)
         # Generate audio from text
         generator = pipeline(text, voice=voice)
         audio_data = None
@@ -1386,7 +1631,7 @@ def preview_file(filename: str):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{safe_filename} — Document Preview</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{ font-family: 'Inter', system-ui, sans-serif; background: linear-gradient(180deg, #071028, #0f1724); color: #e2e8f0; line-height: 1.7; padding: 0; min-height: 100vh; }}
@@ -1435,7 +1680,7 @@ def preview_file(filename: str):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{safe_filename} — Text Preview</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
     <style>
         body {{ font-family: 'JetBrains Mono', monospace; background: linear-gradient(180deg, #071028, #0f1724); color: #cbd5e1; padding: 0; min-height: 100vh; margin: 0; }}
         .doc-header {{ position: sticky; top: 0; z-index: 10; background: rgba(7,16,40,0.92); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.06); padding: 16px 32px; display: flex; align-items: center; gap: 12px; }}
@@ -1466,7 +1711,7 @@ def preview_file(filename: str):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{safe_filename} — CSV Preview</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+
     <style>
         body {{ font-family: 'Inter', sans-serif; background: linear-gradient(180deg, #071028, #0f1724); color: #e2e8f0; padding: 0; min-height: 100vh; margin: 0; }}
         .doc-header {{ position: sticky; top: 0; z-index: 10; background: rgba(7,16,40,0.92); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.06); padding: 16px 32px; display: flex; align-items: center; gap: 12px; }}
@@ -1496,181 +1741,26 @@ def preview_file(filename: str):
 
 @app.post('/reset')
 def reset():
-    global text_vector_store, text_metadata
+    global text_vector_store, text_metadata, knowledge_graph_data
     if text_vector_store is not None and hasattr(text_vector_store, 'reset'):
         text_vector_store.reset()
     text_metadata = []
-    return {"status": "ok", "message": "All knowledge bases cleared."}
+    with kg_lock:
+        knowledge_graph_data = {"nodes": [], "edges": [], "clusters": 0}
+    with ingest_lock:
+        ingest_status["is_running"] = False
+        ingest_status["phase"] = "idle"
+        ingest_status["message"] = ""
+        ingest_status["kg_entities_found"] = 0
+    return {"status": "ok", "message": "All knowledge bases and knowledge graph cleared."}
 
 @app.get('/knowledge-graph')
 def knowledge_graph():
-    """Build a knowledge graph from the current knowledge base metadata."""
-    nodes = []
-    edges = []
-    seen_sources = {}
-    concept_map = {}  # concept_word -> list of source_ids
-
-    STOP_WORDS = {
-        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-        'should', 'may', 'might', 'shall', 'can', 'need', 'dare', 'ought',
-        'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
-        'as', 'into', 'through', 'during', 'before', 'after', 'above', 'below',
-        'between', 'out', 'off', 'over', 'under', 'again', 'further', 'then',
-        'once', 'and', 'but', 'or', 'nor', 'not', 'so', 'if', 'when', 'what',
-        'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'i', 'me',
-        'my', 'myself', 'we', 'our', 'ours', 'you', 'your', 'he', 'she', 'it',
-        'its', 'they', 'them', 'their', 'each', 'all', 'both', 'few', 'more',
-        'most', 'other', 'some', 'such', 'no', 'only', 'own', 'same', 'than',
-        'too', 'very', 'just', 'because', 'here', 'there', 'where', 'how',
-        'also', 'about', 'up', 'down', 'any', 'every', 'while', 'until',
-    }
-
-    # Hub node
-    nodes.append({
-        "id": "hub-knowledge-base",
-        "label": "Knowledge Base",
-        "type": "hub",
-        "size": 55,
-        "description": f"Central repository with {len(text_metadata)} chunks"
-    })
-
-    # Group metadata by source file
-    source_chunks = {}
-    for meta in text_metadata:
-        src = meta.get("source_path", "unknown")
-        if src not in source_chunks:
-            source_chunks[src] = []
-        source_chunks[src].append(meta.get("text", ""))
-
-    # Create file nodes and chunk nodes
-    file_idx = 0
-    for source_path, chunks in source_chunks.items():
-        fname = os.path.basename(source_path)
-        ext = os.path.splitext(fname)[1].lower()
-        base_name = os.path.splitext(fname)[0]
-
-        # Determine type
-        node_type = "document"
-        if ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']:
-            node_type = "image"
-        elif ext in ['.mp3', '.wav', '.m4a', '.ogg', '.flac']:
-            node_type = "audio"
-
-        file_size = 0
-        if os.path.exists(source_path):
-            file_size = os.path.getsize(source_path)
-
-        file_node_id = f"file-{file_idx}"
-        seen_sources[source_path] = file_node_id
-
-        nodes.append({
-            "id": file_node_id,
-            "label": base_name,
-            "type": node_type,
-            "size": max(25, min(45, 20 + int(2 * (len(str(file_size)) if file_size else 1)))),
-            "description": f"{fname} ({len(chunks)} chunks, {file_size / 1024:.1f} KB)",
-            "status": "indexed",
-            "fileType": ext[1:].upper() if ext else ""
-        })
-
-        # Connect to hub
-        edges.append({
-            "source": "hub-knowledge-base",
-            "target": file_node_id,
-            "weight": 0.9,
-            "type": "contains"
-        })
-
-        # Create chunk nodes (up to 5 per file to prevent clutter)
-        for c_idx, chunk_text in enumerate(chunks[:5]):
-            chunk_node_id = f"chunk-{file_idx}-{c_idx}"
-            preview = chunk_text[:80].replace("\n", " ").strip()
-            nodes.append({
-                "id": chunk_node_id,
-                "label": f"Chunk {c_idx + 1}",
-                "type": "chunk",
-                "size": 12,
-                "description": f"{preview}..." if len(chunk_text) > 80 else preview
-            })
-            edges.append({
-                "source": file_node_id,
-                "target": chunk_node_id,
-                "weight": 0.7,
-                "type": "chunk_of"
-            })
-
-        # Extract concepts from all chunks for this file
-        word_freq = {}
-        for chunk in chunks:
-            words = re.findall(r'[a-zA-Z]{4,}', chunk.lower())
-            for w in words:
-                if w not in STOP_WORDS:
-                    word_freq[w] = word_freq.get(w, 0) + 1
-
-        # Take top concepts
-        top_concepts = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:5]
-        for word, freq in top_concepts:
-            concept_id = f"concept-{word}"
-            if word not in concept_map:
-                concept_map[word] = []
-                nodes.append({
-                    "id": concept_id,
-                    "label": word.capitalize(),
-                    "type": "concept",
-                    "size": min(28, 14 + freq),
-                    "description": f"Concept: {word} (freq: {freq})"
-                })
-            concept_map[word].append(file_node_id)
-            edges.append({
-                "source": file_node_id,
-                "target": concept_id,
-                "weight": min(1.0, 0.3 + freq * 0.1),
-                "type": "mentions"
-            })
-
-        file_idx += 1
-
-    # Add inter-concept edges for shared source files
-    concept_list = list(concept_map.keys())
-    for i in range(len(concept_list)):
-        for j in range(i + 1, len(concept_list)):
-            shared = set(concept_map[concept_list[i]]) & set(concept_map[concept_list[j]])
-            if shared:
-                edges.append({
-                    "source": f"concept-{concept_list[i]}",
-                    "target": f"concept-{concept_list[j]}",
-                    "weight": min(1.0, 0.2 * len(shared)),
-                    "type": "related"
-                })
-
-    types = set(n["type"] for n in nodes)
-    return {
-        "nodes": nodes,
-        "edges": edges,
-        "clusters": len(types)
-    }
+    """Return the LLM-extracted knowledge graph built during ingestion."""
+    with kg_lock:
+        return knowledge_graph_data
 
 if __name__ == '__main__':
     import uvicorn
-
-    # Start whisper service as background process
-    whisper_service_path = os.path.join(os.path.dirname(__file__), "whisper_service.py")
-    print(f"Starting whisper service: {whisper_service_path}")
-
-    whisper_process = subprocess.Popen(
-        [sys.executable, whisper_service_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    def cleanup():
-        print("Terminating whisper service...")
-        whisper_process.terminate()
-        whisper_process.wait()
-        print("Whisper service terminated.")
-
-    atexit.register(cleanup)
-
     print("Starting main server on port 8000...")
     uvicorn.run(app, host='0.0.0.0', port=8000)

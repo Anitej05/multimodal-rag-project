@@ -6,12 +6,24 @@ const api = {
     for (const f of files) {
       fd.append('files', f);
     }
-    fd.append('reset_db', 'false'); // Don't reset the database when adding new files
+    fd.append('reset_db', 'false');
     const res = await fetch(`${API_BASE_URL}/ingest`, { 
       method: 'POST', 
       body: fd 
     });
     if (!res.ok) throw new Error(`Ingest failed: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getIngestStatus() {
+    const res = await fetch(`${API_BASE_URL}/ingest-status`);
+    if (!res.ok) throw new Error(`Status check failed: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getKnowledgeGraph() {
+    const res = await fetch(`${API_BASE_URL}/knowledge-graph`);
+    if (!res.ok) throw new Error(`Failed to fetch graph: ${res.statusText}`);
     return res.json();
   },
 
@@ -44,12 +56,12 @@ const api = {
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+        buffer = lines.pop() || '';
 
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed || !trimmed.startsWith('data: ')) continue;
-          const data = trimmed.slice(6); // Remove 'data: '
+          const data = trimmed.slice(6);
 
           if (data === '[DONE]') {
             if (onDone) onDone();
@@ -110,7 +122,7 @@ const api = {
       body: fd 
     });
     if (!res.ok) throw new Error(`Audio generation failed: ${res.statusText}`);
-    return res.blob(); // Return blob for audio file
+    return res.blob();
   },
 
   async resetKB() {
@@ -126,8 +138,6 @@ const api = {
   },
 
   getFilePreviewUrl(filename) {
-    // Routes through the preview endpoint which converts DOCX/TXT/CSV to HTML
-    // and redirects images/PDFs to direct serving
     return `${API_BASE_URL}/files/${encodeURIComponent(filename)}/preview`;
   },
 

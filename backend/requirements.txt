@@ -2,14 +2,15 @@ torch
 faiss-cpu
 fastapi
 uvicorn
-sentence-transformers
+sentence-transformers[image]
 pypdf
 python-docx
 pandas
 faster-whisper
 numpy
-easyocr
 Pillow
 soundfile
 kokoro>=0.9.2
 requests
+qwen-vl-utils>=0.0.14
+mammoth

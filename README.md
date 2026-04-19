@@ -49,24 +49,23 @@
 |   +-------------------------------v--------------------------------+   |
 |   |                     Core RAG Pipeline                          |   |
 |   |                                                                |   |
-|   |  +--------------+  +------------+  +----------+  +----------+ |   |
-|   |  | Sentence     |  | FAISS      |  | Cross-   |  | LM Studio| |   |
-|   |  | Transformer  |  | Vector DB  |  | Encoder  |  | (LLM)    | |   |
-|   |  | MiniLM-L6-v2 |  | L2 / IVF   |  | Re-Rank  |  | Qwen3-4B | |   |
-|   |  +--------------+  +------------+  +----------+  +----------+ |   |
+|   |  +------------------+  +------------+  +----------+  +-------+ |   |
+|   |  | Qwen3-VL-        |  | FAISS      |  | Cross-   |  | LM    | |   |
+|   |  | Embedding-2B     |  | Vector DB  |  | Encoder  |  | Studio| |   |
+|   |  | (Text+Image)     |  | L2 / IVF   |  | Re-Rank  |  | Qwen3 | |   |
+|   |  +------------------+  +------------+  +----------+  +-------+ |   |
 |   +----------------------------------------------------------------+   |
 |                                                                        |
-|   +--------------+   +--------------+   +----------------------------+ |
-|   | Whisper      |   | EasyOCR      |   | Kokoro TTS                 | |
-|   | (ASR, 5001)  |   | (Image OCR)  |   | (Text-to-Speech)           | |
-|   +--------------+   +--------------+   +----------------------------+ |
+|   +--------------+   +----------------------------+                    |
+|   | Whisper      |   | Kokoro TTS                 |                    |
+|   | (ASR, 5001)  |   | (Text-to-Speech)           |                    |
+|   +--------------+   +----------------------------+                    |
 +------------------------------------------------------------------------+
                                     |  HTTP
 +-----------------------------------v------------------------------------+
 |                     LM STUDIO (Local LLM Server)                       |
 |                                                                        |
-|    Text Model  : qwen/qwen3-4b              (Port 1234)               |
-|    Vision Model: smolvlm2-500m-video-instruct                         |
+|    Text Model  : qwen3.5-4b (natively multimodal)   (Port 1234)               |
 |    API         : OpenAI-compatible /v1/chat/completions               |
 +------------------------------------------------------------------------+
 ```
@@ -87,7 +86,7 @@ User uploads files --> FileUpload.jsx --> POST /ingest
                     |   .docx --> python-docx |
                     |   .txt  --> UTF-8 read  |
                     |   .csv  --> pandas      |
-                    |   .png  --> Vision LLM  |
+                    |   .png  --> Qwen3-VL-Embed|
                     |   .mp3  --> Whisper ASR |
                     +------------+------------+
                                  |
@@ -95,7 +94,7 @@ User uploads files --> FileUpload.jsx --> POST /ingest
                     Chunking (400-char, natural breaks)
                                  |
                                  v
-                    SentenceTransformer --> 384-dim embeddings
+                    Qwen3-VL-Embedding-2B --> 2048-dim embeddings
                                  |
                                  v
                     FAISS Vector Store (FlatL2 / IVFFlat)
@@ -133,14 +132,12 @@ Read    --> AI response   --> POST /generate_audio --> Kokoro TTS --> browser pl
 | **Frontend** | React 18, Vanilla CSS | UI with dark/light theme support |
 | **Graph Viz** | Cytoscape.js + cose-bilkent | Interactive knowledge graph |
 | **Backend** | FastAPI + Uvicorn | REST API + SSE streaming server |
-| **LLM** | LM Studio (Qwen3-4B) | Text generation & streaming |
-| **VLM** | LM Studio (SmolVLM2-500M) | Image understanding |
-| **Embeddings** | SentenceTransformer (MiniLM-L6-v2) | 384-dim text embeddings |
+| **LLM** | LM Studio (Qwen3.5-4B) | Multimodal text+image generation & streaming |
+| **Multimodal Embeddings** | Qwen3-VL-Embedding-2B (SentenceTransformer) | 2048-dim text & image embeddings |
 | **Re-ranking** | CrossEncoder (ms-marco-MiniLM) | Search result re-ranking |
 | **Vector DB** | FAISS (FlatL2 / IVFFlat) | Similarity search index |
 | **ASR** | Faster-Whisper (base) | Speech-to-text |
 | **TTS** | Kokoro TTS | Text-to-speech |
-| **OCR** | EasyOCR | Image text extraction |
 | **Doc Parsing** | pypdf, python-docx, pandas, mammoth | File content extraction |
 
 ---
@@ -195,10 +192,10 @@ The Retrieval-Augmented Generation pipeline is the core intelligence of the syst
    - **PDF**: `pypdf.PdfReader` extracts page text
    - **DOCX**: `python-docx` extracts paragraphs
    - **TXT/CSV**: Direct read / pandas parsing
-   - **Images**: Sent to LM Studio's Vision model for text description
+   - **Images**: Embedded directly by Qwen3-VL-Embedding-2B into the shared vector space
    - **Audio**: Forwarded to the Whisper microservice for transcription
 3. **Chunking** — Extracted text is split into ~400-character chunks at natural break points (paragraphs → sentences → words → hard cut).
-4. **Embedding** — Each chunk is encoded into a 384-dimensional vector using `all-MiniLM-L6-v2`.
+4. **Embedding** — Each chunk (and each image) is encoded into a 2048-dimensional vector using `Qwen3-VL-Embedding-2B`.
 5. **Indexing** — Vectors are stored in FAISS; the index type is chosen dynamically:
    - < 39 chunks → `IndexFlatL2` (brute-force, exact search)
    - ≥ 39 chunks → `IndexIVFFlat` (clustered, approximate search with `nlist = 4√N`, capped at 256)
@@ -264,7 +261,7 @@ The Knowledge Graph provides an **interactive, Obsidian-inspired visualization**
 |-------------|---------|
 | **Python** | 3.10+ with pip |
 | **Node.js** | 18+ with npm |
-| **LM Studio** | Running on `localhost:1234` with `qwen/qwen3-4b` (text) and `smolvlm2-500m-video-instruct` (vision) loaded |
+| **LM Studio** | Running on `localhost:1234` with `qwen3.5-4b` loaded |
 | **Optional** | NVIDIA GPU for CUDA acceleration; MS Word for DOCX→PDF preview |
 
 ### Backend

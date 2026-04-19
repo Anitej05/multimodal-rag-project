@@ -9,7 +9,6 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
   const [recorder, setRecorder] = useState(null);
   const [isRecording, setIsRecording] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
-  const [audio, setAudio] = useState(null);
   const [availableFiles, setAvailableFiles] = useState([]);
 
   const chatMessagesRef = useRef(null);
@@ -264,15 +263,21 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
   };
 
   const readAloud = async () => {
-    if (audio && !audio.paused) {
-      audio.pause();
-      showToast('Audio paused', 'info');
+    // Use browser's built-in SpeechSynthesis — works offline, no server calls
+    if (!('speechSynthesis' in window)) {
+      showToast('Text-to-speech not supported in this browser', 'error');
       return;
     }
 
-    if (audio && audio.paused) {
-      audio.play();
-      showToast('Playing audio...', 'info');
+    // If already speaking, toggle pause/resume
+    if (window.speechSynthesis.speaking) {
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+        showToast('Resumed playback', 'info');
+      } else {
+        window.speechSynthesis.pause();
+        showToast('Paused playback', 'info');
+      }
       return;
     }
 
@@ -282,30 +287,38 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
       return;
     }
 
-    try {
-      showToast('Generating audio...', 'info');
-      const audioBlob = await api.generateAudio(lastAIMessage.text);
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const newAudio = new Audio(audioUrl);
-      
-      newAudio.onended = () => {
-        URL.revokeObjectURL(audioUrl);
-        setAudio(null);
-      };
+    // Strip HTML tags and source markers for clean speech
+    const cleanText = lastAIMessage.text
+      .split('--%Sources%--')[0]
+      .replace(/<[^>]*>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
 
-      newAudio.onerror = () => {
-        URL.revokeObjectURL(audioUrl);
-        setAudio(null);
-        showToast('Error playing audio', 'error');
-      };
-
-      setAudio(newAudio);
-      newAudio.play();
-      showToast('Playing audio...', 'info');
-    } catch (err) {
-      console.error('Error generating audio:', err);
-      showToast(`Audio generation failed: ${err.message}`, 'error');
+    if (!cleanText) {
+      showToast('No text content to read', 'error');
+      return;
     }
+
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+
+    // Prefer a female / natural-sounding voice
+    const voices = window.speechSynthesis.getVoices();
+    const preferredVoice =
+      voices.find(v => v.lang.startsWith('en') && /zira|jenny|aria|female|woman|samantha|karen|fiona|hazel|susan|linda/i.test(v.name)) ||
+      voices.find(v => v.lang.startsWith('en') && /Google.*Female|Microsoft.*Online/i.test(v.name)) ||
+      voices.find(v => v.lang.startsWith('en')) ||
+      voices[0];
+    if (preferredVoice) utterance.voice = preferredVoice;
+
+    utterance.onend = () => showToast('Finished reading', 'info');
+    utterance.onerror = () => showToast('Speech synthesis error', 'error');
+
+    window.speechSynthesis.cancel(); // Cancel any pending
+    window.speechSynthesis.speak(utterance);
+    showToast('Reading aloud...', 'info');
   };
 
   const clearChat = () => {

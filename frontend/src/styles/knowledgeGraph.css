@@ -10,25 +10,26 @@
   height: 100%;
   border-radius: 14px;
   overflow: hidden;
-  background:
-    radial-gradient(ellipse 80% 60% at 50% 40%, rgba(99,102,241,0.04), transparent),
-    radial-gradient(ellipse 60% 50% at 80% 70%, rgba(244,114,182,0.03), transparent),
-    linear-gradient(180deg, #060d1f 0%, #0a1128 100%);
-  border: 1px solid rgba(255,255,255,0.05);
-  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  background: var(--card);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 6px rgba(0,0,0,0.2);
 }
 
-/* ── Toolbar ── */
+/* ── Toolbar (Floating Command Bar) ── */
 .kg-toolbar {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 10px 16px;
-  background: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.01));
-  border-bottom: 1px solid rgba(255,255,255,0.06);
-  backdrop-filter: blur(12px);
-  flex-shrink: 0;
-  gap: 12px;
+  gap: 16px;
+  padding: 12px 20px;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 100px;
+  backdrop-filter: blur(20px);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5), 0 0 0 1px rgba(0,0,0,0.2), inset 0 1px 1px rgba(255,255,255,0.1);
   z-index: 20;
 }
 
@@ -64,8 +65,8 @@
 /* ── Search ── */
 .kg-search-box {
   position: relative;
-  flex: 1;
-  max-width: 240px;
+  width: 200px;
+  flex-shrink: 0;
 }
 
 .kg-search-icon {
@@ -97,9 +98,9 @@
 }
 
 .kg-search-input:focus {
-  border-color: rgba(99,102,241,0.4);
+  border-color: var(--primary);
   background: rgba(0,0,0,0.5);
-  box-shadow: 0 0 0 2px rgba(99,102,241,0.1);
+  box-shadow: 0 0 0 1px var(--primary);
 }
 
 /* ── Layout selector ── */
@@ -132,8 +133,8 @@
 }
 
 .kg-layout-select:focus {
-  border-color: rgba(99,102,241,0.4);
-  box-shadow: 0 0 0 2px rgba(99,102,241,0.1);
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary);
 }
 
 .kg-layout-select option {
@@ -776,4 +777,121 @@
   .kg-legend {
     display: none;
   }
+}
+
+/* ══════════════════════════
+   Indexing Indicator
+   ══════════════════════════ */
+.kg-indexing-indicator {
+  position: absolute;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  border-radius: 20px;
+  background: rgba(99,102,241,0.15);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(99,102,241,0.25);
+  z-index: 15;
+  font-size: 12px;
+  font-weight: 600;
+  color: #a5b4fc;
+  animation: kgPulse 2s ease-in-out infinite;
+}
+
+@keyframes kgPulse {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; }
+}
+
+/* Pulsing dot on KG tab during indexing */
+.kg-indexing-badge {
+  color: #6366f1;
+  font-size: 10px;
+  margin-left: 4px;
+  animation: kgBadgePulse 1.5s ease-in-out infinite;
+}
+
+@keyframes kgBadgePulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* ══════════════════════════
+   Ingest Progress Bar (KnowledgeBase)
+   ══════════════════════════ */
+.ingest-progress {
+  margin: 12px 0 8px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(99,102,241,0.06);
+  border: 1px solid rgba(99,102,241,0.12);
+}
+
+.ingest-progress-bar {
+  width: 100%;
+  height: 3px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.05);
+  overflow: visible; /* Allow glow to bleed */
+  margin-bottom: 10px;
+}
+
+.ingest-progress-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--primary);
+  box-shadow: 0 0 10px var(--primary), 0 0 20px var(--primary);
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+}
+
+/* Add a bright core to the laser */
+.ingest-progress-fill::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 10px;
+  height: 10px;
+  background: #ffffff;
+  border-radius: 50%;
+  box-shadow: 0 0 15px #ffffff, 0 0 25px var(--primary);
+}
+
+.ingest-progress-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #a5b4fc;
+}
+
+.ingest-progress-detail {
+  font-size: 11px;
+  color: #94a3b8;
+  margin-top: 4px;
+}
+
+.light-theme .ingest-progress {
+  background: rgba(99,102,241,0.05);
+  border-color: rgba(99,102,241,0.15);
+}
+
+.light-theme .ingest-progress-bar {
+  background: rgba(0,0,0,0.06);
+}
+
+.light-theme .ingest-progress-text {
+  color: #6366f1;
+}
+
+.light-theme .kg-indexing-indicator {
+  background: rgba(99,102,241,0.1);
+  color: #6366f1;
 }
