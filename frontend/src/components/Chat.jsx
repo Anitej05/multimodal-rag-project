@@ -17,6 +17,16 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
   const streamContentRef = useRef(''); // Accumulate tokens without re-render
   const rafRef = useRef(null);
 
+  // Strip markdown code fences (```html ... ```) that the LLM sometimes wraps around HTML output
+  const stripCodeFences = (text) => {
+    if (!text) return text;
+    // Remove opening ```html or ```HTML or just ``` at the start
+    let cleaned = text.replace(/^\s*```(?:html|HTML)?\s*\n?/gm, '');
+    // Remove closing ``` 
+    cleaned = cleaned.replace(/\n?\s*```\s*$/gm, '');
+    return cleaned;
+  };
+
   // Fetch list of available files so we can match source names to actual filenames
   useEffect(() => {
     const fetchFiles = async () => {
@@ -140,7 +150,7 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
           if (rafRef.current) cancelAnimationFrame(rafRef.current);
           rafRef.current = requestAnimationFrame(() => {
             if (streamBubbleRef.current) {
-              streamBubbleRef.current.innerHTML = streamContentRef.current;
+              streamBubbleRef.current.innerHTML = stripCodeFences(streamContentRef.current);
               scrollToBottom();
             }
           });
@@ -153,7 +163,7 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
           if (rafRef.current) cancelAnimationFrame(rafRef.current);
 
           // Build final message with sources
-          let finalContent = streamContentRef.current;
+          let finalContent = stripCodeFences(streamContentRef.current);
           
           if (sourcesData && sourcesData.length > 0) {
             // Build sources HTML

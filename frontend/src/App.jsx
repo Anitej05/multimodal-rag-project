@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Header from './components/Header';
 import KnowledgeBase from './components/KnowledgeBase';
 import Chat from './components/Chat';
@@ -31,6 +31,10 @@ function App() {
   const [toast, setToast] = useState(null);
   const [activeView, setActiveView] = useState('chat'); // 'chat' or 'graph'
   const [isIndexing, setIsIndexing] = useState(false);
+
+  // Resize state
+  const [leftWidth, setLeftWidth] = useState(35); // percentage
+  const [isResizing, setIsResizing] = useState(false);
 
   // Initialize theme state from localStorage or default to light mode
   const [isDarkMode, setIsDarkMode] = useState(() => {
@@ -74,6 +78,44 @@ function App() {
     localStorage.setItem('theme', JSON.stringify(newTheme));
   };
 
+  // Resizing logic
+  const startResizing = useCallback(() => {
+    setIsResizing(true);
+  }, []);
+
+  const stopResizing = useCallback(() => {
+    setIsResizing(false);
+  }, []);
+
+  const resize = useCallback((e) => {
+    if (isResizing) {
+      const newWidth = (e.clientX / window.innerWidth) * 100;
+      if (newWidth > 20 && newWidth < 70) {
+        setLeftWidth(newWidth);
+      }
+    }
+  }, [isResizing]);
+
+  useEffect(() => {
+    if (isResizing) {
+      window.addEventListener('mousemove', resize);
+      window.addEventListener('mouseup', stopResizing);
+      document.body.style.userSelect = 'none';
+      document.body.style.cursor = 'col-resize';
+    } else {
+      window.removeEventListener('mousemove', resize);
+      window.removeEventListener('mouseup', stopResizing);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    }
+    return () => {
+      window.removeEventListener('mousemove', resize);
+      window.removeEventListener('mouseup', stopResizing);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+  }, [isResizing, resize, stopResizing]);
+
   return (
     <div className={isDarkMode ? '' : 'light-theme'}>
       <ThemeToggle isDark={isDarkMode} onToggle={toggleTheme} />
@@ -108,7 +150,10 @@ function App() {
       </div>
 
       {/* Main content - KnowledgeBase is always mounted to preserve state */}
-      <main className={`container ${activeView === 'graph' ? 'container-graph' : ''}`}>
+      <main 
+        className={`container ${activeView === 'graph' ? 'container-graph' : ''} ${isResizing ? 'resizing' : ''}`}
+        style={{ gridTemplateColumns: `${leftWidth}% 4px minmax(0, 1fr)` }}
+      >
         {/* Left Column - Knowledge Base (always rendered, never unmounts) */}
         <KnowledgeBase
           uploadedFiles={uploadedFiles}
@@ -118,8 +163,15 @@ function App() {
           onIndexingChange={setIsIndexing}
         />
 
-        {/* Right Column - switches between Chat and Graph */}
-        {activeView === 'chat' && (
+        {/* Resizer Handle */}
+        <div 
+          className={`resizer ${isResizing ? 'active' : ''}`} 
+          onMouseDown={startResizing}
+          title="Drag to resize"
+        />
+
+        {/* Right Column - Chat is always mounted to preserve streaming state */}
+        <div style={{ display: activeView === 'chat' ? 'flex' : 'none', flexDirection: 'column', minHeight: 0 }}>
           <Chat
             messages={messages}
             addMessage={addMessage}
@@ -127,7 +179,7 @@ function App() {
             clearMessages={clearMessages}
             showToast={showToast}
           />
-        )}
+        </div>
 
         {activeView === 'graph' && (
           <KnowledgeGraph
