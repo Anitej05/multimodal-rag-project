@@ -4,6 +4,11 @@ New main.py using LM Studio API instead of local models
 Combines functionality from main.py and main_hybrid.py
 Preserves all original functionality except LLM inference method
 """
+import os
+import site
+import sys
+
+# Removed PaddleOCR DLL loading and env vars as we are strictly using EasyOCR
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +18,7 @@ from typing import List
 import threading
 import torch
 import faiss
-import os
+import gc
 import base64
 import warnings
 import requests
@@ -126,6 +131,23 @@ ingest_status = {
 ingest_lock = threading.Lock()
 
 print("Backend: In-memory Vector DBs initialized.")
+
+# --- Mode Management (RAG vs Digitize) ---
+active_mode = "rag"  # "rag" or "digitize"
+mode_lock = threading.Lock()
+ocr_model = None  # PaddleOCR instance, loaded lazily
+
+# --- Digitize Session State ---
+digitize_status = {
+    "is_running": False,
+    "total_pages": 0,
+    "processed_pages": 0,
+    "current_file": "",
+    "phase": "idle",  # idle, processing, done, error
+    "message": "",
+}
+digitize_lock = threading.Lock()
+digitize_results = {}  # session_id -> {pages: [...], text: str, ...}
 
 # --- LM Studio API Helper Functions ---
 # Model configuration - Qwen3.5-4B is natively multimodal (text + images)
@@ -405,6 +427,10 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     All content (text, images, audio transcriptions) lives in the same embedding space.
     """
     print(f"\n=== DEBUG: retrieve_multimodal_context called with query: {query!r} ===")
+
+    if embedding_model is None:
+        print("DEBUG: embedding_model is not loaded (system may be in digitize mode)")
+        return []
 
     all_candidates = []
 
@@ -928,9 +954,110 @@ def build_knowledge_graph_from_metadata():
           f"{entity_count} entities across {len(categories)} categories")
 
 
+# --- Model Management Functions ---
+def unload_rag_models():
+    """Unload embedding, cross-encoder, and whisper models to free GPU VRAM."""
+    global embedding_model, cross_encoder_model, whisper_model
+    print("Backend: Unloading RAG models to free VRAM...")
+
+    try:
+        del embedding_model
+    except Exception:
+        pass
+    embedding_model = None
+
+    try:
+        del cross_encoder_model
+    except Exception:
+        pass
+    cross_encoder_model = None
+
+    try:
+        del whisper_model
+    except Exception:
+        pass
+    whisper_model = None
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        print(f"Backend: VRAM after unload — {free/1024**3:.1f} GB free / {total/1024**3:.1f} GB total")
+    print("Backend: RAG models unloaded.")
+
+
+def reload_rag_models():
+    """Reload embedding, cross-encoder, and whisper models onto GPU."""
+    global embedding_model, cross_encoder_model, whisper_model
+    print("Backend: Reloading RAG models...")
+
+    print(f"Backend: Loading embedding model from {EMB_MODEL_PATH}...")
+    embedding_model = SentenceTransformer(
+        EMB_MODEL_PATH, device=DEVICE, model_kwargs={"torch_dtype": "bfloat16"},
+    )
+    print(f"Backend: Embedding model loaded on {DEVICE}.")
+
+    print(f"Backend: Loading cross-encoder from {CE_MODEL_PATH}...")
+    try:
+        cross_encoder_model = CrossEncoder(CE_MODEL_PATH, max_length=512, device=DEVICE)
+        print(f"Backend: Cross-encoder loaded on {DEVICE}.")
+    except Exception as e:
+        print(f"Failed to reload cross-encoder: {e}")
+        cross_encoder_model = None
+
+    print(f"Backend: Loading Whisper from {WHISPER_MODEL_PATH}...")
+    try:
+        from faster_whisper import WhisperModel as FW
+        WHISPER_COMPUTE = "float16" if DEVICE == "cuda" else "int8"
+        whisper_model = FW(WHISPER_MODEL_PATH, device=DEVICE, compute_type=WHISPER_COMPUTE)
+        print(f"Backend: Whisper loaded on {DEVICE}.")
+    except Exception as e:
+        print(f"Backend: Whisper failed to reload: {e}")
+        whisper_model = None
+
+    print("Backend: RAG models reloaded.")
+
+
+def load_ocr_model(lang="en"):
+    """Load EasyOCR engine."""
+    global ocr_model
+    if ocr_model is not None:
+        return ocr_model
+
+    # EasyOCR — PyTorch-based, uses existing CUDA setup
+    try:
+        import easyocr
+        lang_map = {'en': ['en'], 'ch': ['ch_sim', 'en'], 'japan': ['ja', 'en'],
+                    'korean': ['ko', 'en'], 'fr': ['fr', 'en'], 'de': ['de', 'en']}
+        ocr_langs = lang_map.get(lang, ['en'])
+        use_gpu = torch.cuda.is_available()
+        ocr_model = easyocr.Reader(ocr_langs, gpu=use_gpu, verbose=False)
+        print(f"Backend: EasyOCR loaded on {'GPU' if use_gpu else 'CPU'}.")
+        return ocr_model
+    except Exception as e:
+        print(f"Backend: EasyOCR failed to load: {e}")
+        return None
+
+
+def unload_ocr_model():
+    """Unload PaddleOCR to free memory."""
+    global ocr_model
+    if ocr_model is not None:
+        del ocr_model
+        ocr_model = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    print("Backend: PaddleOCR unloaded.")
+
+
 # --- API Schemas ---
 class ChatRequest(BaseModel):
     query: str
+
+class SwitchModeRequest(BaseModel):
+    mode: str  # "rag" or "digitize"
 
 # --- API Endpoints ---
 @app.post("/ingest")
@@ -1029,7 +1156,7 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
                     elif lower.endswith('.pdf'):
                         try:
                             reader = pypdf.PdfReader(saved_path)
-                            text = "\n".join([page.extract_text() for page in reader.pages])
+                            text = "\n".join([p.extract_text() or "" for p in reader.pages])
                         except Exception as e:
                             print(f"Error reading PDF {file_name}: {e}")
                             text = ""
@@ -1050,12 +1177,12 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
                             print(f"Error reading CSV {file_name}: {e}")
                             text = ""
 
-                    elif lower.endswith('.txt'):
+                    elif lower.endswith(('.txt', '.md')):
                         try:
                             with open(saved_path, 'r', encoding='utf-8') as f:
                                 text = f.read()
                         except Exception as e:
-                            print(f"Error reading TXT {file_name}: {e}")
+                            print(f"Error reading TXT/MD {file_name}: {e}")
                             text = ""
                     else:
                         continue
@@ -1759,6 +1886,414 @@ def knowledge_graph():
     """Return the LLM-extracted knowledge graph built during ingestion."""
     with kg_lock:
         return knowledge_graph_data
+
+# --- Mode Switching Endpoints ---
+@app.post('/switch-mode')
+async def switch_mode(payload: SwitchModeRequest):
+    """Switch between RAG and Digitize modes, managing GPU VRAM."""
+    global active_mode
+    target = payload.mode.lower()
+    if target not in ("rag", "digitize"):
+        raise HTTPException(status_code=400, detail="Mode must be 'rag' or 'digitize'")
+
+    with mode_lock:
+        if active_mode == target:
+            return {"status": "ok", "mode": active_mode, "message": f"Already in {target} mode."}
+
+        if target == "digitize":
+            # Unload RAG models, load OCR
+            unload_rag_models()
+            load_ocr_model()
+            active_mode = "digitize"
+            return {"status": "ok", "mode": "digitize", "message": "Switched to Digitize mode. RAG models unloaded."}
+        else:
+            # Unload OCR, reload RAG models
+            unload_ocr_model()
+            reload_rag_models()
+            active_mode = "rag"
+            return {"status": "ok", "mode": "rag", "message": "Switched to RAG mode. Models reloaded."}
+
+@app.get('/mode-status')
+def mode_status():
+    """Return current active mode and model states."""
+    with mode_lock:
+        vram_info = {}
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            vram_info = {"vram_free_gb": round(free / 1024**3, 2), "vram_total_gb": round(total / 1024**3, 2)}
+        return {
+            "mode": active_mode,
+            "rag_models_loaded": embedding_model is not None,
+            "ocr_model_loaded": ocr_model is not None,
+            **vram_info
+        }
+
+# --- Digitize Endpoints ---
+@app.post('/digitize')
+async def digitize(files: List[UploadFile] = File(...), lang: str = Form(default="en")):
+    """OCR scanned documents using PaddleOCR PP-OCRv4."""
+    global digitize_results
+
+    if active_mode != "digitize":
+        raise HTTPException(status_code=400, detail="Not in Digitize mode. Switch mode first.")
+
+    with digitize_lock:
+        if digitize_status["is_running"]:
+            return {"status": "error", "message": "Digitization already in progress."}
+
+    # Save files
+    saved = []
+    for f in files:
+        fname = f.filename or f"scan_{id(f)}"
+        path = os.path.join(UPLOAD_DIR, fname)
+        with open(path, "wb") as out:
+            out.write(await f.read())
+        saved.append({"name": fname, "path": path})
+
+    import uuid
+    session_id = str(uuid.uuid4())[:8]
+
+    with digitize_lock:
+        digitize_status["is_running"] = True
+        digitize_status["total_pages"] = 0
+        digitize_status["processed_pages"] = 0
+        digitize_status["current_file"] = ""
+        digitize_status["phase"] = "processing"
+        digitize_status["message"] = "Starting OCR..."
+
+    def background_ocr(saved_files, sid, language):
+        global digitize_results
+        try:
+            ocr = load_ocr_model(language)
+            if ocr is None:
+                with digitize_lock:
+                    digitize_status["phase"] = "error"
+                    digitize_status["message"] = "PaddleOCR failed to load."
+                    digitize_status["is_running"] = False
+                return
+
+            all_pages = []
+            full_text_parts = []
+
+            for file_info in saved_files:
+                fname = file_info["name"]
+                fpath = file_info["path"]
+
+                with digitize_lock:
+                    digitize_status["current_file"] = fname
+                    digitize_status["message"] = f"Processing {fname}..."
+
+                lower = fpath.lower()
+                images_to_ocr = []
+
+                if lower.endswith('.pdf'):
+                    # Convert PDF pages to images
+                    try:
+                        from pdf2image import convert_from_path, pdfinfo_from_path
+                        # Optimize memory: extract pages in small batches or clear them aggressively
+                        info = pdfinfo_from_path(fpath)
+                        total_pages = info["Pages"]
+                        for i in range(total_pages):
+                            # Load one page at a time to keep RAM usage extremely low
+                            pil_images = convert_from_path(fpath, dpi=300, first_page=i+1, last_page=i+1)
+                            for img in pil_images:
+                                temp_path = os.path.join(UPLOAD_DIR, f"_ocr_page_{sid}_{i}.png")
+                                img.save(temp_path, "PNG")
+                                images_to_ocr.append({"path": temp_path, "page": i + 1, "source": fname})
+                                img.close()
+                            del pil_images
+                            gc.collect()
+                    except ImportError:
+                        # Fallback: try pypdf to extract images
+                        try:
+                            reader = pypdf.PdfReader(fpath)
+                            for i, page in enumerate(reader.pages):
+                                # Extract text directly as fallback
+                                page_text = page.extract_text() or ""
+                                if page_text.strip():
+                                    all_pages.append({
+                                        "page": i + 1, "source": fname,
+                                        "text": page_text, "boxes": [],
+                                        "confidence": 0.9, "method": "text_extract"
+                                    })
+                                    full_text_parts.append(page_text)
+                        except Exception as e:
+                            print(f"PDF fallback failed: {e}")
+                        continue
+                    except Exception as e:
+                        print(f"PDF conversion error for {fname}: {e}")
+                        continue
+                elif lower.endswith(('.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp', '.webp')):
+                    images_to_ocr.append({"path": fpath, "page": 1, "source": fname})
+                else:
+                    continue
+
+                with digitize_lock:
+                    digitize_status["total_pages"] += len(images_to_ocr)
+
+                for img_info in images_to_ocr:
+                    try:
+                        page_text = ""
+                        boxes = []
+
+                        # EasyOCR: returns list of (bbox, text, confidence)
+                        results = ocr.readtext(img_info["path"])
+                        
+                        # Structure the output: sort by Y, then by X
+                        structured_boxes = []
+                        for (bbox_poly, text, conf) in results:
+                            center_y = sum([p[1] for p in bbox_poly]) / 4
+                            center_x = sum([p[0] for p in bbox_poly]) / 4
+                            height = max([p[1] for p in bbox_poly]) - min([p[1] for p in bbox_poly])
+                            structured_boxes.append({
+                                'center_y': center_y,
+                                'center_x': center_x,
+                                'height': height,
+                                'bbox_poly': bbox_poly,
+                                'text': text,
+                                'conf': conf
+                            })
+                            
+                        # Sort vertically
+                        structured_boxes.sort(key=lambda x: x['center_y'])
+                        
+                        # Group into lines
+                        lines = []
+                        if structured_boxes:
+                            current_line = [structured_boxes[0]]
+                            for box in structured_boxes[1:]:
+                                # Threshold based on text height (e.g., half the height)
+                                threshold = max(box['height'], current_line[-1]['height']) * 0.6
+                                if abs(box['center_y'] - current_line[-1]['center_y']) < threshold:
+                                    current_line.append(box)
+                                else:
+                                    lines.append(current_line)
+                                    current_line = [box]
+                            lines.append(current_line)
+                            
+                        # Sort horizontally and construct text
+                        for line in lines:
+                            line.sort(key=lambda x: x['center_x'])
+                            line_text = " ".join([b['text'] for b in line])
+                            page_text += line_text + "\n\n"
+                            
+                            for b in line:
+                                bbox_points = [[int(p[0]), int(p[1])] for p in b['bbox_poly']]
+                                boxes.append({
+                                    "bbox": bbox_points,
+                                    "text": b['text'],
+                                    "confidence": round(float(b['conf']), 3)
+                                })
+
+                        gc.collect()
+
+                        all_pages.append({
+                            "page": img_info["page"],
+                            "source": img_info["source"],
+                            "text": page_text.strip(),
+                            "boxes": boxes,
+                            "confidence": round(
+                                sum(b["confidence"] for b in boxes) / max(len(boxes), 1), 3
+                            ),
+                            "image_path": img_info["path"],
+                        })
+                        full_text_parts.append(page_text)
+
+                    except Exception as e:
+                        print(f"OCR error on page {img_info['page']} of {img_info['source']}: {e}")
+                        all_pages.append({
+                            "page": img_info["page"], "source": img_info["source"],
+                            "text": "", "boxes": [], "confidence": 0, "error": str(e),
+                            "image_path": img_info["path"],
+                        })
+
+                    with digitize_lock:
+                        digitize_status["processed_pages"] += 1
+                        digitize_status["message"] = f"Page {digitize_status['processed_pages']}/{digitize_status['total_pages']}"
+
+            full_text_final = "\n\n".join(full_text_parts)
+            
+            # Save the structured text to output/datalab-output-{filename}.md
+            try:
+                out_dir = os.path.join(os.path.dirname(__file__), "output")
+                os.makedirs(out_dir, exist_ok=True)
+                for f in saved_files:
+                    fname = f["name"]
+                    out_path = os.path.join(out_dir, f"datalab-output-{fname}.md")
+                    with open(out_path, "w", encoding="utf-8") as out_f:
+                        out_f.write(full_text_final)
+            except Exception as e:
+                print(f"Failed to save structured output: {e}")
+
+            # Store results
+            digitize_results[sid] = {
+                "pages": all_pages,
+                "full_text": full_text_final,
+                "total_pages": len(all_pages),
+                "files": [f["name"] for f in saved_files],
+            }
+
+            with digitize_lock:
+                digitize_status["phase"] = "done"
+                digitize_status["message"] = f"Done! {len(all_pages)} pages processed."
+                digitize_status["is_running"] = False
+
+        except Exception as e:
+            print(f"Background OCR error: {e}")
+            import traceback
+            traceback.print_exc()
+            with digitize_lock:
+                digitize_status["phase"] = "error"
+                digitize_status["message"] = f"Error: {e}"
+                digitize_status["is_running"] = False
+
+    thread = threading.Thread(
+        target=background_ocr, args=(saved, session_id, lang), daemon=True
+    )
+    thread.start()
+
+    return {"status": "ok", "session_id": session_id, "message": f"OCR started for {len(saved)} file(s)."}
+
+@app.get('/digitize-status')
+def get_digitize_status():
+    """Return current digitization progress."""
+    with digitize_lock:
+        return {**digitize_status}
+
+@app.get('/digitize-results/{session_id}')
+def get_digitize_results(session_id: str):
+    """Return OCR results for a completed session."""
+    if session_id not in digitize_results:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return digitize_results[session_id]
+
+@app.get('/digitize-page-image/{session_id}/{page_num}')
+def get_digitize_page_image(session_id: str, page_num: int):
+    """Serve the scanned page image for overlay display."""
+    if session_id not in digitize_results:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    pages = digitize_results[session_id]["pages"]
+    for p in pages:
+        if p["page"] == page_num and "image_path" in p:
+            img_path = p["image_path"]
+            if os.path.exists(img_path):
+                return FileResponse(img_path, media_type="image/png")
+    raise HTTPException(status_code=404, detail="Page image not found.")
+
+@app.get('/digitize-output-file/{filename:path}')
+def get_digitize_output_file(filename: str):
+    """Serve a generated file from the output directory."""
+    out_dir = os.path.join(os.path.dirname(__file__), "output")
+    file_path = os.path.join(out_dir, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Output file not found.")
+
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        return FileResponse(file_path, media_type="application/pdf")
+    elif lower.endswith(".md"):
+        return FileResponse(file_path, media_type="text/markdown")
+    elif lower.endswith(".html"):
+        # Wrap the raw HTML content in a beautifully styled page
+        with open(file_path, 'r', encoding='utf-8') as f:
+            raw_html = f.read()
+        styled_page = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    color: #e2e8f0;
+    line-height: 1.8;
+    padding: 2rem;
+    min-height: 100vh;
+  }}
+  h1 {{ font-size: 1.8rem; font-weight: 700; color: #a78bfa; margin: 1.5rem 0 0.8rem; border-bottom: 2px solid rgba(167,139,250,0.3); padding-bottom: 0.4rem; }}
+  h2 {{ font-size: 1.4rem; font-weight: 600; color: #818cf8; margin: 1.3rem 0 0.6rem; }}
+  h3 {{ font-size: 1.15rem; font-weight: 600; color: #67e8f9; margin: 1rem 0 0.5rem; }}
+  h4, h5 {{ font-size: 1rem; font-weight: 600; color: #34d399; margin: 0.8rem 0 0.4rem; }}
+  p {{ margin: 0.5rem 0; color: #cbd5e1; }}
+  ul, ol {{ margin: 0.5rem 0 0.5rem 1.5rem; }}
+  li {{ margin: 0.3rem 0; color: #cbd5e1; }}
+  b, strong {{ color: #f1f5f9; font-weight: 600; }}
+  img {{
+    max-width: 100%;
+    border-radius: 12px;
+    margin: 1rem 0;
+    border: 1px solid rgba(148,163,184,0.2);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  }}
+  .img-description {{
+    background: rgba(30,41,59,0.8);
+    border: 1px solid rgba(148,163,184,0.15) !important;
+    border-radius: 8px;
+    padding: 0.75rem 1rem !important;
+    margin: 0.5rem 0 1rem;
+    font-size: 0.85rem;
+    color: #94a3b8;
+    font-style: italic;
+  }}
+</style>
+</head>
+<body>
+{raw_html}
+</body>
+</html>"""
+        return HTMLResponse(content=styled_page)
+    else:
+        return FileResponse(file_path)
+
+@app.post('/digitize/download')
+async def download_digitized(session_id: str = Form(...), format: str = Form(default="txt")):
+    """Download OCR results in specified format (txt, md, docx)."""
+    if session_id not in digitize_results:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    data = digitize_results[session_id]
+    full_text = data["full_text"]
+    files_str = ", ".join(data["files"])
+
+    if format == "txt":
+        buffer = io.BytesIO(full_text.encode("utf-8"))
+        return StreamingResponse(buffer, media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="digitized_{session_id}.txt"'})
+
+    elif format == "md":
+        md_parts = [f"# Digitized Document\n\n**Source:** {files_str}\n"]
+        for page in data["pages"]:
+            md_parts.append(f"\n## Page {page['page']} — {page['source']}\n")
+            md_parts.append(f"*Confidence: {page['confidence']:.1%}*\n\n")
+            md_parts.append(page["text"] + "\n")
+        md_text = "\n".join(md_parts)
+        buffer = io.BytesIO(md_text.encode("utf-8"))
+        return StreamingResponse(buffer, media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="digitized_{session_id}.md"'})
+
+    elif format == "docx":
+        from docx import Document as DocxDocument
+        from docx.shared import Pt, Inches
+        doc = DocxDocument()
+        doc.add_heading("Digitized Document", 0)
+        doc.add_paragraph(f"Source: {files_str}")
+        for page in data["pages"]:
+            doc.add_heading(f"Page {page['page']} — {page['source']}", level=2)
+            doc.add_paragraph(f"Confidence: {page['confidence']:.1%}", style='Intense Quote')
+            for line in page["text"].split("\n"):
+                if line.strip():
+                    doc.add_paragraph(line)
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+        return StreamingResponse(buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="digitized_{session_id}.docx"'})
+
+    else:
+        raise HTTPException(status_code=400, detail="Format must be txt, md, or docx.")
 
 if __name__ == '__main__':
     import uvicorn

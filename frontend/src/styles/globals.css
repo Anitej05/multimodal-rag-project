@@ -225,6 +225,14 @@ body::after {
   height: calc(100vh - 138px);
 }
 
+/* Digitize view — full width single column */
+.container-digitize {
+  display: flex !important;
+  grid-template-columns: unset !important;
+  padding: 0 16px;
+  height: calc(100vh - 138px);
+}
+
 /* ── View Switcher ── */
 .view-switcher {
   display: flex;
