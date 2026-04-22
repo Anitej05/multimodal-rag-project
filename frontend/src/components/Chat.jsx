@@ -16,6 +16,7 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
   const streamBubbleRef = useRef(null);
   const streamContentRef = useRef(''); // Accumulate tokens without re-render
   const rafRef = useRef(null);
+  const userScrolledUpRef = useRef(false); // Track if user manually scrolled up
 
   // Fetch list of available files so we can match source names to actual filenames
   useEffect(() => {
@@ -32,15 +33,27 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
     fetchFiles();
   }, [messages]);
 
+  // Check if user is near the bottom of chat (within 80px threshold)
+  const isNearBottom = useCallback(() => {
+    const el = chatMessagesRef.current;
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }, []);
+
+  // Track user scroll to detect manual scroll-up
+  const handleChatScroll = useCallback(() => {
+    userScrolledUpRef.current = !isNearBottom();
+  }, [isNearBottom]);
+
   useEffect(() => {
-    if (chatMessagesRef.current) {
+    if (chatMessagesRef.current && !userScrolledUpRef.current) {
       chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
     }
   }, [messages, isTyping, isStreaming]);
 
-  // Auto-scroll during streaming via RAF
+  // Auto-scroll during streaming via RAF — only if user hasn't scrolled up
   const scrollToBottom = useCallback(() => {
-    if (chatMessagesRef.current) {
+    if (chatMessagesRef.current && !userScrolledUpRef.current) {
       chatMessagesRef.current.scrollTop = chatMessagesRef.current.scrollHeight;
     }
   }, []);
@@ -122,6 +135,7 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
     setIsTyping(true);
     setIsStreaming(false);
     streamContentRef.current = '';
+    userScrolledUpRef.current = false; // Reset scroll lock when sending new message
 
     try {
       let sourcesData = null;
@@ -140,7 +154,10 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
           if (rafRef.current) cancelAnimationFrame(rafRef.current);
           rafRef.current = requestAnimationFrame(() => {
             if (streamBubbleRef.current) {
-              streamBubbleRef.current.innerHTML = streamContentRef.current;
+              // Only strip code fences — leave everything else as the LLM sends it
+              let content = streamContentRef.current;
+              content = content.replace(/```(?:html|markdown|text|md|)\s*\n?/gi, '');
+              streamBubbleRef.current.innerHTML = content;
               scrollToBottom();
             }
           });
@@ -154,6 +171,9 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
 
           // Build final message with sources
           let finalContent = streamContentRef.current;
+          // Only strip code fences
+          finalContent = finalContent.replace(/```(?:html|markdown|text|md|)\s*\n?/gi, '');
+
           
           if (sourcesData && sourcesData.length > 0) {
             // Build sources HTML
@@ -346,7 +366,7 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
         </div>
 
         <div className="chat-container">
-          <div className="chat-messages" ref={chatMessagesRef}>
+          <div className="chat-messages" ref={chatMessagesRef} onScroll={handleChatScroll}>
             {messages.length === 0 && !isStreaming ? (
               <div className="empty-state">
                 <div className="empty-icon">🤖</div>

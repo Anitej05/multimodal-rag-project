@@ -67,37 +67,113 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Load Models (from local models/ directory, GPU-accelerated) ---
+# --- Model Manager (GPU VRAM Mode-Switching) ---
 EMB_MODEL_PATH = os.path.join(MODELS_DIR, "qwen3-vl-embedding-2b")
 CE_MODEL_PATH = os.path.join(MODELS_DIR, "cross-encoder-minilm")
-
-print(f"Backend: Loading embedding model from {EMB_MODEL_PATH}...")
-embedding_model = SentenceTransformer(
-    EMB_MODEL_PATH,
-    device=DEVICE,
-    model_kwargs={"torch_dtype": "bfloat16"},
-)
-print(f"Backend: Embedding model loaded on {DEVICE}. Dim: {embedding_model.get_sentence_embedding_dimension()}")
-
-print(f"Backend: Loading cross-encoder from {CE_MODEL_PATH}...")
-try:
-    cross_encoder_model = CrossEncoder(CE_MODEL_PATH, max_length=512, device=DEVICE)
-    print(f"Backend: Cross-encoder loaded on {DEVICE}.")
-except Exception as e:
-    print(f"Failed to load cross-encoder: {e}")
-    cross_encoder_model = None
-# --- Load Whisper (in-process, from local models/) ---
 WHISPER_COMPUTE = "float16" if DEVICE == "cuda" else "int8"
-print(f"Backend: Loading Whisper from {WHISPER_MODEL_PATH} on {DEVICE}...")
-try:
-    from faster_whisper import WhisperModel
-    whisper_model = WhisperModel(WHISPER_MODEL_PATH, device=DEVICE, compute_type=WHISPER_COMPUTE)
-    print(f"Backend: Whisper loaded on {DEVICE}.")
-except Exception as e:
-    print(f"Backend: Whisper failed to load: {e}")
-    whisper_model = None
 
-print("Backend: All models loaded.")
+class ModelManager:
+    """
+    Manages GPU VRAM by dynamically loading/unloading models.
+    Modes:
+      - "rag": embedding, cross-encoder, whisper loaded on GPU
+      - "digitize": all RAG models offloaded, GPU free for PaddleOCR
+    """
+    def __init__(self):
+        self.mode = "rag"
+        self.lock = threading.Lock()
+        self.embedding_model = None
+        self.cross_encoder_model = None
+        self.whisper_model = None
+        self._load_rag_models()
+
+    def _load_rag_models(self):
+        """Load all RAG models onto GPU."""
+        print("ModelManager: Loading RAG models on GPU...")
+
+        print(f"  Loading embedding model from {EMB_MODEL_PATH}...")
+        self.embedding_model = SentenceTransformer(
+            EMB_MODEL_PATH,
+            device=DEVICE,
+            model_kwargs={"torch_dtype": "bfloat16"},
+        )
+        print(f"  Embedding model loaded. Dim: {self.embedding_model.get_sentence_embedding_dimension()}")
+
+        print(f"  Loading cross-encoder from {CE_MODEL_PATH}...")
+        try:
+            self.cross_encoder_model = CrossEncoder(CE_MODEL_PATH, max_length=512, device=DEVICE)
+            print(f"  Cross-encoder loaded on {DEVICE}.")
+        except Exception as e:
+            print(f"  Failed to load cross-encoder: {e}")
+            self.cross_encoder_model = None
+
+        print(f"  Loading Whisper from {WHISPER_MODEL_PATH}...")
+        try:
+            from faster_whisper import WhisperModel
+            self.whisper_model = WhisperModel(WHISPER_MODEL_PATH, device=DEVICE, compute_type=WHISPER_COMPUTE)
+            print(f"  Whisper loaded on {DEVICE}.")
+        except Exception as e:
+            print(f"  Whisper failed to load: {e}")
+            self.whisper_model = None
+
+        self.mode = "rag"
+        print("ModelManager: All RAG models loaded. Mode = rag")
+
+    def _unload_rag_models(self):
+        """Unload all RAG models from GPU to free VRAM."""
+        print("ModelManager: Unloading RAG models from GPU...")
+        self.embedding_model = None
+        self.cross_encoder_model = None
+        self.whisper_model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        import gc
+        gc.collect()
+        self.mode = "digitize"
+        print("ModelManager: RAG models unloaded. VRAM freed. Mode = digitize")
+
+    def switch_to_digitize(self):
+        """Switch to digitize mode — free GPU for OCR."""
+        with self.lock:
+            if self.mode == "digitize":
+                return {"mode": "digitize", "status": "already_active"}
+            self._unload_rag_models()
+            return {"mode": "digitize", "status": "ready"}
+
+    def switch_to_rag(self):
+        """Switch to RAG mode — reload models on GPU."""
+        with self.lock:
+            if self.mode == "rag":
+                return {"mode": "rag", "status": "already_active"}
+            self._load_rag_models()
+            return {"mode": "rag", "status": "ready"}
+
+    def get_status(self):
+        return {
+            "mode": self.mode,
+            "embedding_loaded": self.embedding_model is not None,
+            "cross_encoder_loaded": self.cross_encoder_model is not None,
+            "whisper_loaded": self.whisper_model is not None,
+            "gpu_available": torch.cuda.is_available(),
+            "vram_allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024, 1) if torch.cuda.is_available() else 0,
+        }
+
+# Initialize the model manager (loads RAG models on startup)
+model_mgr = ModelManager()
+
+# Convenience accessors (so existing code doesn't break)
+# These are properties that read from model_mgr
+def _get_embedding_model():
+    return model_mgr.embedding_model
+
+def _get_cross_encoder():
+    return model_mgr.cross_encoder_model
+
+def _get_whisper():
+    return model_mgr.whisper_model
+
+print("Backend: All models loaded via ModelManager.")
 
 # --- Vector Stores (FAISS) ---
 print("Backend: Initializing vector stores...")
@@ -412,7 +488,7 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     if text_vector_store is not None:
         print(f"DEBUG: Vector store size: {text_vector_store.ntotal}")
         if text_vector_store.ntotal > 0:
-            query_embedding = embedding_model.encode(query, convert_to_tensor=True).float().cpu().numpy()
+            query_embedding = model_mgr.embedding_model.encode(query, convert_to_tensor=True).float().cpu().numpy()
             query_embedding = query_embedding.reshape(1, -1)
             distances, indices = text_vector_store.search(query_embedding, k=min(top_k * 2, text_vector_store.ntotal))
 
@@ -436,10 +512,10 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
 
     # 2. RE-RANK with cross-encoder (only for text candidates, not raw images)
     text_candidates = [c for c in all_candidates if c["type"] == "text" and c.get("text", "").strip()]
-    if text_candidates and cross_encoder_model is not None:
+    if text_candidates and model_mgr.cross_encoder_model is not None:
         try:
             pairs = [[query, cand["text"]] for cand in text_candidates]
-            cross_encoder_scores = cross_encoder_model.predict(pairs)
+            cross_encoder_scores = model_mgr.cross_encoder_model.predict(pairs)
             for i, candidate in enumerate(text_candidates):
                 candidate["cross_encoder_score"] = normalize_score(cross_encoder_scores[i], "cross_encoder")
         except Exception as e:
@@ -933,6 +1009,27 @@ class ChatRequest(BaseModel):
     query: str
 
 # --- API Endpoints ---
+
+@app.post("/save-file")
+async def save_file(file: UploadFile = File(...)):
+    """Save a file to the uploads directory (no ingestion/embedding).
+    Used by Digitize → Ingest to RAG when models may be unloaded."""
+    try:
+        file_name = file.filename or f"digitized_{id(file)}.txt"
+        saved_path = os.path.join(UPLOAD_DIR, file_name)
+        contents = await file.read()
+        with open(saved_path, "wb") as f_out:
+            f_out.write(contents)
+        return {
+            "status": "ok",
+            "filename": file_name,
+            "path": saved_path,
+            "size": len(contents),
+            "message": f"File '{file_name}' saved. Switch to Chat tab and click 'Index Knowledge Base' to ingest."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
 @app.post("/ingest")
 async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(default="true")):
     global text_vector_store, text_metadata, knowledge_graph_data
@@ -995,7 +1092,7 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
                         try:
                             print(f"DEBUG: Embedding image directly: {file_name}")
                             img = Image.open(saved_path).convert("RGB")
-                            img_embedding = embedding_model.encode(img, convert_to_tensor=True).float().cpu().numpy()
+                            img_embedding = model_mgr.embedding_model.encode(img, convert_to_tensor=True).float().cpu().numpy()
                             img_embedding = img_embedding.reshape(1, -1)
 
                             if text_vector_store is None:
@@ -1016,8 +1113,8 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
 
                     elif lower.endswith((".mp3", ".wav", ".m4a")):
                         try:
-                            if whisper_model is not None:
-                                segments, _ = whisper_model.transcribe(saved_path, beam_size=5)
+                            if model_mgr.whisper_model is not None:
+                                segments, _ = model_mgr.whisper_model.transcribe(saved_path, beam_size=5)
                                 text = "".join(seg.text for seg in segments)
                             else:
                                 text = ""
@@ -1079,7 +1176,7 @@ async def ingest(files: List[UploadFile] = File(...), reset_db: str = Form(defau
                     ingest_status["message"] = f"Embedding {len(all_text_chunks)} text chunks..."
 
                 texts = [c['text'] for c in all_text_chunks]
-                text_embeddings = embedding_model.encode(texts, convert_to_tensor=True, show_progress_bar=True).float().cpu().numpy()
+                text_embeddings = model_mgr.embedding_model.encode(texts, convert_to_tensor=True, show_progress_bar=True).float().cpu().numpy()
 
                 if text_vector_store is None or (should_reset and len(text_metadata) == 0):
                     text_vector_store, _ = choose_index_type(len(all_text_chunks), text_embedding_dim)
@@ -1405,10 +1502,10 @@ async def chat_audio(file: UploadFile = File(...)):
             buffer.write(await file.read())
 
         # Use in-process Whisper model
-        if whisper_model is None:
-            return {"answer": "Whisper model not loaded"}
+        if model_mgr.whisper_model is None:
+            return {"answer": "Whisper model not loaded. Switch to RAG mode first."}
         try:
-            segments, _ = whisper_model.transcribe(temp_path, beam_size=5)
+            segments, _ = model_mgr.whisper_model.transcribe(temp_path, beam_size=5)
             transcribed_query = "".join(seg.text for seg in segments).strip()
         except Exception as e:
             return {"answer": f"Error transcribing audio: {e}"}
@@ -1438,10 +1535,10 @@ async def transcribe(file: UploadFile = File(...)):
             buffer.write(await file.read())
 
         # Use in-process Whisper model
-        if whisper_model is None:
-            return {"error": "Whisper model not loaded"}
+        if model_mgr.whisper_model is None:
+            return {"error": "Whisper model not loaded. Switch to RAG mode first."}
         try:
-            segments, _ = whisper_model.transcribe(temp_path, beam_size=5)
+            segments, _ = model_mgr.whisper_model.transcribe(temp_path, beam_size=5)
             transcription = "".join(seg.text for seg in segments)
             return {"transcription": transcription}
         except Exception as e:
@@ -1759,6 +1856,87 @@ def knowledge_graph():
     """Return the LLM-extracted knowledge graph built during ingestion."""
     with kg_lock:
         return knowledge_graph_data
+
+# --- GPU Mode Switching (RAG ↔ Digitize) ---
+@app.post('/mode/digitize')
+def switch_to_digitize():
+    """Unload RAG models from GPU to free VRAM for PaddleOCR."""
+    result = model_mgr.switch_to_digitize()
+    return result
+
+@app.post('/mode/rag')
+def switch_to_rag():
+    """Reload RAG models onto GPU."""
+    result = model_mgr.switch_to_rag()
+    return result
+
+@app.get('/mode/status')
+def mode_status():
+    """Get current mode and model status."""
+    return model_mgr.get_status()
+
+# --- PaddleOCR Proxy ---
+PADDLE_OCR_URL = "http://localhost:8010"
+
+@app.post('/ocr/upload')
+async def ocr_upload(file: UploadFile = File(...)):
+    """
+    Proxy endpoint: forwards an uploaded file to the PaddleOCR PPStructure service.
+    Returns structured blocks, annotated image, and DOCX download info.
+    """
+    try:
+        file_bytes = await file.read()
+        filename = file.filename or "upload.png"
+
+        # Forward to PPStructure endpoint for full layout analysis
+        ocr_response = requests.post(
+            f"{PADDLE_OCR_URL}/ocr/structure",
+            files={"file": (filename, file_bytes, file.content_type or "image/png")},
+            timeout=600
+        )
+
+        if ocr_response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"OCR service returned {ocr_response.status_code}")
+
+        return ocr_response.json()
+
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(
+            status_code=503,
+            detail="PaddleOCR service is not running. Please start it on port 8010."
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="OCR processing timed out.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
+
+
+@app.get('/ocr/download/{filename}')
+def ocr_download(filename: str):
+    """Proxy DOCX download from the OCR service."""
+    try:
+        r = requests.get(f"{PADDLE_OCR_URL}/ocr/download/{filename}", timeout=30, stream=True)
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail="File not found")
+
+        from starlette.responses import Response
+        return Response(
+            content=r.content,
+            media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+        )
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=503, detail="OCR service not reachable")
+
+
+@app.get('/ocr/health')
+def ocr_health():
+    """Check if the PaddleOCR microservice is reachable."""
+    try:
+        r = requests.get(f"{PADDLE_OCR_URL}/health", timeout=5)
+        return {"status": "ok", "ocr_service": r.json()}
+    except Exception:
+        return {"status": "unavailable", "message": "PaddleOCR service not reachable on port 8010"}
 
 if __name__ == '__main__':
     import uvicorn

@@ -145,7 +145,54 @@ const api = {
     const res = await fetch(`${API_BASE_URL}/files`);
     if (!res.ok) throw new Error(`List files failed: ${res.statusText}`);
     return res.json();
+  },
+
+  async ocrUpload(file) {
+    const fd = new FormData();
+    fd.append('file', file);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 min
+    try {
+      const res = await fetch(`${API_BASE_URL}/ocr/upload`, {
+        method: 'POST',
+        body: fd,
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `OCR failed: ${res.statusText}`);
+      }
+      return res.json();
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err.name === 'AbortError') {
+        throw new Error('OCR processing timed out. Try a smaller file or single page.');
+      }
+      throw err;
+    }
+  },
+
+  async ocrHealth() {
+    const res = await fetch(`${API_BASE_URL}/ocr/health`);
+    if (!res.ok) throw new Error(`OCR health check failed: ${res.statusText}`);
+    return res.json();
+  },
+
+  // --- GPU Mode Switching ---
+  async switchMode(mode) {
+    // mode: 'digitize' or 'rag'
+    const res = await fetch(`${API_BASE_URL}/mode/${mode}`, { method: 'POST' });
+    if (!res.ok) throw new Error(`Mode switch failed: ${res.statusText}`);
+    return res.json();
+  },
+
+  async getModeStatus() {
+    const res = await fetch(`${API_BASE_URL}/mode/status`);
+    if (!res.ok) throw new Error(`Mode status failed: ${res.statusText}`);
+    return res.json();
   }
 };
 
 export default api;
+

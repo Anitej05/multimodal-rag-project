@@ -1,0 +1,9 @@
+#
+# Additional dependencies (paddlepaddle + paddleocr are installed in Dockerfile)
+#
+fastapi>=0.100.0
+python-multipart>=0.0.6
+uvicorn>=0.23.0
+requests>=2.31.0
+pyyaml
+opencv-python-headless
