@@ -1,407 +1,405 @@
 # -*- coding: utf-8 -*-
+"""
+PP-StructureV3 Document Digitization Router
+Uses PaddleX pipeline for state-of-the-art layout analysis,
+OCR, table recognition, formula recognition, and Markdown output.
+"""
 
 import os
+import io
+import sys
+import base64
 import tempfile
 import traceback
 import shutil
-import base64
+
 import cv2
 import numpy as np
-
-from fastapi import APIRouter, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse
-from paddleocr import PaddleOCR, PPStructure, draw_structure_result, save_structure_res
-from utils.ImageHelper import base64_to_ndarray, bytes_to_ndarray
-from models.OCRModel import Base64PostModel
-from models.RestfulModel import RestfulModel
 from PIL import Image
-import requests
+from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi.responses import FileResponse
 
-OCR_LANGUAGE = os.environ.get("OCR_LANGUAGE", "en")
-USE_GPU = os.environ.get("USE_GPU", "true").lower() == "true"
+router = APIRouter(prefix="/ocr")
+
+# ── Output directory ──
 OUTPUT_DIR = "/app/ocr_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-router = APIRouter(prefix="/ocr", tags=["OCR"])
-
-# --- Initialize PaddleOCR (basic OCR) ---
-print(f"Initializing PaddleOCR with lang={OCR_LANGUAGE}, gpu={USE_GPU}...")
-ocr = PaddleOCR(use_angle_cls=True, lang=OCR_LANGUAGE, use_gpu=USE_GPU)
-print("PaddleOCR initialized successfully.")
-
-# --- Initialize PPStructure (layout analysis + recovery) ---
-print(f"Initializing PPStructure with recovery=True, lang={OCR_LANGUAGE}, gpu={USE_GPU}...")
-structure_engine = PPStructure(
-    recovery=True,
-    lang=OCR_LANGUAGE,
-    use_gpu=USE_GPU,
-    show_log=False,
-)
-print("PPStructure initialized successfully.")
+# ── Global pipeline instance ──
+_pipeline = None
 
 
-def normalize_result(result):
+def get_pipeline():
+    """Lazy-init the PP-StructureV3 pipeline (only once)."""
+    global _pipeline
+    if _pipeline is None:
+        print("Initializing PP-StructureV3 pipeline (this may download models on first run)...")
+        sys.stdout.flush()
+        from paddlex import create_pipeline
+        _pipeline = create_pipeline(pipeline="PP-StructureV3")
+        print("PP-StructureV3 pipeline initialized successfully.")
+        sys.stdout.flush()
+    return _pipeline
+
+
+# ── Warm up on import ──
+try:
+    get_pipeline()
+except Exception as e:
+    print(f"Warning: PP-StructureV3 init deferred — will retry on first request. Error: {e}")
+    sys.stdout.flush()
+
+
+# ════════════════════════════════════════════════════
+#  Helper: Convert a PIL Image to base64 PNG string
+# ════════════════════════════════════════════════════
+def pil_to_base64(pil_img):
+    """Convert a PIL Image to a base64-encoded PNG string."""
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+# ════════════════════════════════════════════════════
+#  Helper: Extract annotated image from result
+# ════════════════════════════════════════════════════
+def get_annotated_image(res, viz_dir):
     """
-    Normalize PaddleOCR output to a consistent format:
-    [ [ [coords, (text, confidence)], ... ], ... ]
-    Works with both v2 and v3 APIs.
+    Try multiple methods to get the annotated/visualization image:
+    1. res.img dict → look for layout visualization
+    2. save_to_img → read from disk
+    Returns base64 string or None.
     """
-    if result is None:
-        return [[]]
-
-    normalized = []
-    for page in result:
-        if page is None:
-            normalized.append([])
-            continue
-        page_items = []
-        for item in page:
-            if isinstance(item, dict):
-                # v3 format
-                text = item.get("rec_text", item.get("text", ""))
-                score = item.get("rec_score", item.get("score", 0.0))
-                coords = item.get("dt_polys", item.get("poly", []))
-                page_items.append([coords, [str(text), float(score)]])
-            elif isinstance(item, (list, tuple)):
-                # v2 format: [coords, (text, confidence)]
-                page_items.append(item)
-        normalized.append(page_items)
-    return normalized
-
-
-def run_ocr(img_input):
-    """Run OCR and return normalized results."""
+    # Method 1: Try res.img attribute
     try:
-        result = ocr.ocr(img_input, cls=True)
-        return normalize_result(result)
+        img_data = res.img
+        if isinstance(img_data, dict):
+            # Try common keys
+            for key in ["layout", "ocr", "table", "res"]:
+                if key in img_data and img_data[key] is not None:
+                    pil_img = img_data[key]
+                    if isinstance(pil_img, Image.Image):
+                        return pil_to_base64(pil_img)
+            # Try first available image
+            for key, val in img_data.items():
+                if isinstance(val, Image.Image):
+                    return pil_to_base64(val)
+        elif isinstance(img_data, Image.Image):
+            return pil_to_base64(img_data)
+        elif isinstance(img_data, np.ndarray):
+            pil_img = Image.fromarray(cv2.cvtColor(img_data, cv2.COLOR_BGR2RGB))
+            return pil_to_base64(pil_img)
     except Exception as e:
-        print(f"OCR engine error: {e}")
-        traceback.print_exc()
-        raise
+        print(f"  res.img failed: {e}")
 
-
-def draw_ocr_boxes(image_bytes_or_path, ocr_results):
-    """Draw bounding boxes on the image and return as base64 PNG."""
+    # Method 2: Try save_to_img
     try:
-        if isinstance(image_bytes_or_path, str):
-            img = cv2.imread(image_bytes_or_path)
-        elif isinstance(image_bytes_or_path, bytes):
-            nparr = np.frombuffer(image_bytes_or_path, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        else:
-            img = image_bytes_or_path
-
-        if img is None:
-            return None
-
-        for page in ocr_results:
-            if not isinstance(page, list):
-                continue
-            for item in page:
-                if not isinstance(item, list) or len(item) < 2:
-                    continue
-                coords = item[0]
-                text_info = item[1]
-                if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
-                    confidence = float(text_info[1])
-                else:
-                    confidence = 0.0
-
-                # Color based on confidence
-                if confidence >= 0.9:
-                    color = (0, 200, 0)   # Green
-                elif confidence >= 0.7:
-                    color = (0, 180, 255)  # Orange
-                else:
-                    color = (0, 0, 255)    # Red
-
-                if coords and len(coords) >= 4:
-                    pts = np.array(coords, dtype=np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(img, [pts], True, color, 2)
-
-        _, buffer = cv2.imencode('.png', img)
-        return base64.b64encode(buffer).decode('utf-8')
+        page_viz_dir = os.path.join(viz_dir, "viz_page")
+        os.makedirs(page_viz_dir, exist_ok=True)
+        res.save_to_img(save_path=page_viz_dir)
+        # Find any saved image
+        for root, dirs, files in os.walk(page_viz_dir):
+            for f in sorted(files):
+                if f.lower().endswith((".png", ".jpg", ".jpeg")):
+                    img_path = os.path.join(root, f)
+                    with open(img_path, "rb") as fh:
+                        b64 = base64.b64encode(fh.read()).decode("utf-8")
+                    shutil.rmtree(page_viz_dir, ignore_errors=True)
+                    return b64
+        shutil.rmtree(page_viz_dir, ignore_errors=True)
     except Exception as e:
-        print(f"Error drawing boxes: {e}")
-        traceback.print_exc()
-        return None
+        print(f"  save_to_img failed: {e}")
+
+    return None
 
 
-def run_structure_analysis(img_path_or_bytes, filename="document"):
-    """
-    Run PPStructure for layout analysis + recovery.
-    Returns structured result, annotated image, and path to recovered DOCX.
-    """
+# ════════════════════════════════════════════════════
+#  Helper: Extract structured blocks from JSON result
+# ════════════════════════════════════════════════════
+def extract_blocks(res):
+    """Parse the JSON result into structured blocks with type, bbox, text."""
+    blocks = []
     try:
-        # Read image
-        if isinstance(img_path_or_bytes, str):
-            img = cv2.imread(img_path_or_bytes)
-            img_pil = Image.open(img_path_or_bytes).convert('RGB')
-        else:
-            nparr = np.frombuffer(img_path_or_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        json_data = res.json
+        if not isinstance(json_data, dict):
+            return blocks
 
-        if img is None:
-            raise ValueError("Failed to read image")
+        # PP-StructureV3 JSON has different possible structures
+        # Try to get layout elements
+        parsing_result = json_data.get("parsing_result", [])
+        if isinstance(parsing_result, list):
+            for elem in parsing_result:
+                if isinstance(elem, dict):
+                    blocks.append({
+                        "type": elem.get("label", elem.get("type", "text")),
+                        "bbox": elem.get("bbox", []),
+                        "text": elem.get("text", elem.get("content", "")),
+                    })
 
-        # Run PPStructure
-        result = structure_engine(img)
+        # If no parsing_result, try layout_det_result
+        if not blocks:
+            layout_result = json_data.get("layout_det_result", json_data.get("layout_result", {}))
+            if isinstance(layout_result, dict):
+                det_boxes = layout_result.get("boxes", [])
+                for box_info in det_boxes:
+                    if isinstance(box_info, dict):
+                        blocks.append({
+                            "type": box_info.get("label", "text"),
+                            "bbox": box_info.get("coordinate", box_info.get("bbox", [])),
+                            "text": box_info.get("text", ""),
+                        })
+    except Exception as e:
+        print(f"  Block extraction failed: {e}")
+        traceback.print_exc()
 
-        # Build structured output
-        structured_blocks = []
-        full_text_parts = []
-        for block in result:
-            block_type = block.get('type', 'unknown')
-            bbox = block.get('bbox', [])
-            res = block.get('res', None)
+    return blocks
 
-            block_data = {
-                'type': block_type,
-                'bbox': bbox,
-            }
 
-            if block_type == 'table' and isinstance(res, dict):
-                block_data['html'] = res.get('html', '')
-                block_data['text'] = '[Table]'
-                full_text_parts.append('[Table]')
-            elif isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
-                # v3 format (paddleocr 2.9.x): list of {'text': ..., 'confidence': ..., 'text_region': ...}
-                texts = []
-                for item in res:
-                    t = item.get('text', '')
-                    if t:
-                        texts.append(str(t))
-                block_data['text'] = ' '.join(texts)
-                full_text_parts.append(' '.join(texts))
-            elif isinstance(res, (list, tuple)) and len(res) == 2:
-                # v2 format: (boxes, [(text, conf), ...])
-                boxes, text_results = res
-                texts = []
-                if isinstance(text_results, list):
-                    for text_conf in text_results:
-                        if isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2:
-                            texts.append(str(text_conf[0]))
-                        elif isinstance(text_conf, dict):
-                            texts.append(str(text_conf.get('text', '')))
-                        else:
-                            texts.append(str(text_conf))
-                block_data['text'] = ' '.join(texts)
-                full_text_parts.append(' '.join(texts))
-            else:
-                block_data['text'] = ''
+# ════════════════════════════════════════════════════
+#  ENDPOINTS
+# ════════════════════════════════════════════════════
 
-            structured_blocks.append(block_data)
+@router.get("/health")
+def health():
+    """Health check endpoint."""
+    engine_ready = _pipeline is not None
+    return {
+        "status": "ok",
+        "engine": "PP-StructureV3 (PaddleX)",
+        "ready": engine_ready
+    }
 
-        # Draw annotated image with colored bounding boxes
+
+@router.post("/structure")
+async def structure_analysis(file: UploadFile = File(...)):
+    """
+    Run PP-StructureV3 on an uploaded image or PDF.
+    Returns: markdown text, annotated images, structured blocks.
+    """
+    pipe = get_pipeline()
+    filename = file.filename or "upload.png"
+    file_bytes = await file.read()
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # Save uploaded file to temp path
+    suffix = os.path.splitext(filename)[1].lower() or ".png"
+    valid_suffixes = {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
+    if suffix not in valid_suffixes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '{suffix}'. Supported: {', '.join(valid_suffixes)}"
+        )
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(tmp_fd)
+    with open(tmp_path, "wb") as f:
+        f.write(file_bytes)
+
+    viz_dir = tempfile.mkdtemp()
+
+    try:
+        print(f"Processing: {filename} ({len(file_bytes)} bytes)")
+        sys.stdout.flush()
+
+        # ── Run PP-StructureV3 pipeline ──
+        output = pipe.predict(
+            input=tmp_path,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
+
+        all_markdown_parts = []
+        all_blocks = []
+        annotated_pages = []
+        page_count = 0
+
+        for res in output:
+            page_count += 1
+            print(f"  Page {page_count}: processing...")
+            sys.stdout.flush()
+
+            # ── 1. Extract Markdown (with embedded images) ──
+            md_text = ""
+            try:
+                md_data = res.markdown
+                if isinstance(md_data, dict):
+                    md_text = md_data.get("markdown_texts", "")
+                    # Embed images as base64 data URIs so they render everywhere
+                    md_images = md_data.get("markdown_images", {})
+                    if md_images and isinstance(md_images, dict):
+                        for img_name, pil_img in md_images.items():
+                            try:
+                                if isinstance(pil_img, Image.Image):
+                                    buf = io.BytesIO()
+                                    pil_img.save(buf, format="PNG")
+                                    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                                    data_uri = f"data:image/png;base64,{b64}"
+                                    # Replace markdown image references
+                                    md_text = md_text.replace(f"]({img_name})", f"]({data_uri})")
+                                    md_text = md_text.replace(f'src="{img_name}"', f'src="{data_uri}"')
+                                    print(f"    Embedded image: {img_name}")
+                            except Exception as img_err:
+                                print(f"    Image embed failed for {img_name}: {img_err}")
+                elif isinstance(md_data, str):
+                    md_text = md_data
+                else:
+                    md_text = str(md_data) if md_data else ""
+            except Exception as e:
+                print(f"  Markdown extraction failed: {e}")
+                traceback.print_exc()
+
+            all_markdown_parts.append(md_text)
+
+            # ── 2. Extract annotated visualization ──
+            ann_b64 = get_annotated_image(res, viz_dir)
+            if ann_b64:
+                annotated_pages.append(ann_b64)
+
+            # ── 3. Extract structured blocks ──
+            page_blocks = extract_blocks(res)
+            all_blocks.extend(page_blocks)
+
+            print(f"  Page {page_count}: done (md={len(md_text)} chars, blocks={len(page_blocks)}, viz={'yes' if ann_b64 else 'no'})")
+            sys.stdout.flush()
+
+        # ── Save Markdown file for download ──
+        basename = os.path.splitext(filename)[0]
+        save_dir = os.path.join(OUTPUT_DIR, basename)
+        os.makedirs(save_dir, exist_ok=True)
+
+        combined_markdown = "\n\n---\n\n".join(all_markdown_parts) if len(all_markdown_parts) > 1 else (all_markdown_parts[0] if all_markdown_parts else "")
+
+        md_filename = f"{basename}.md"
+        md_path = os.path.join(save_dir, md_filename)
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(combined_markdown)
+        print(f"Markdown saved: {md_path}")
+        sys.stdout.flush()
+
+        # ── Also generate a styled PDF from the markdown ──
+        pdf_filename = f"{basename}_structured.pdf"
+        pdf_path = os.path.join(save_dir, pdf_filename)
         try:
-            annotated_img = img.copy()
-            type_colors = {
-                'text': (0, 200, 0),       # Green
-                'title': (180, 105, 255),   # Purple
-                'table': (255, 180, 0),     # Blue-ish
-                'figure': (0, 140, 255),    # Orange
-                'list': (180, 105, 255),    # Pink
-                'header': (0, 200, 255),    # Yellow
-                'footer': (160, 160, 160),  # Gray
-            }
-            for block in result:
-                bbox = block.get('bbox', [])
-                btype = block.get('type', 'text').lower()
-                color = type_colors.get(btype, (0, 200, 0))
-                if len(bbox) == 4:
-                    x1, y1, x2, y2 = [int(v) for v in bbox]
-                    cv2.rectangle(annotated_img, (x1, y1), (x2, y2), color, 2)
-                    # Draw type label
-                    label_size, _ = cv2.getTextSize(btype, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.rectangle(annotated_img, (x1, y1 - label_size[1] - 6), (x1 + label_size[0] + 4, y1), color, -1)
-                    cv2.putText(annotated_img, btype, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            _, buffer = cv2.imencode('.png', annotated_img)
-            annotated_b64 = base64.b64encode(buffer).decode('utf-8')
-        except Exception as e:
-            print(f"Warning: annotation drawing failed: {e}")
+            _generate_pdf_from_markdown(combined_markdown, pdf_path)
+            has_pdf = True
+            print(f"PDF saved: {pdf_path}")
+        except Exception as pdf_err:
+            has_pdf = False
+            print(f"Warning: PDF generation failed: {pdf_err}")
             traceback.print_exc()
-            annotated_b64 = None
-
-        # Layout recovery to DOCX
-        docx_path = None
-        try:
-            from paddleocr.ppstructure.recovery.recovery_to_doc import sorted_layout_boxes, convert_info_docx
-            h, w, _ = img.shape
-            basename = os.path.splitext(filename)[0]
-            save_dir = os.path.join(OUTPUT_DIR, basename)
-            os.makedirs(save_dir, exist_ok=True)
-            # Save structure results first (creates cropped images needed by recovery)
-            save_structure_res(result, save_dir, basename)
-            res = sorted_layout_boxes(result, w)
-            convert_info_docx(img, res, save_dir, basename)
-            expected_docx = os.path.join(save_dir, f"{basename}.docx")
-            if os.path.exists(expected_docx):
-                docx_path = expected_docx
-                print(f"DOCX saved: {docx_path}")
-            else:
-                # Check for _ocr.docx variant
-                alt_docx = os.path.join(save_dir, f"{basename}_ocr.docx")
-                if os.path.exists(alt_docx):
-                    docx_path = alt_docx
-                    print(f"DOCX saved: {docx_path}")
-        except Exception as e:
-            print(f"Warning: Layout recovery failed: {e}")
-            traceback.print_exc()
+        sys.stdout.flush()
 
         return {
-            'blocks': structured_blocks,
-            'full_text': '\n'.join(full_text_parts),
-            'block_count': len(structured_blocks),
-            'annotated_image': annotated_b64,
-            'docx_path': docx_path,
+            "status": "ok",
+            "filename": filename,
+            "markdown": combined_markdown,
+            "full_text": combined_markdown,
+            "annotated_image": annotated_pages[0] if annotated_pages else None,
+            "annotated_pages": annotated_pages,
+            "block_count": len(all_blocks) or page_count,
+            "blocks": all_blocks,
+            "page_count": page_count,
+            "has_markdown": True,
+            "has_pdf": has_pdf,
+            "markdown_filename": md_filename,
+            "pdf_filename": pdf_filename if has_pdf else None,
         }
+
     except Exception as e:
-        print(f"Structure analysis error: {e}")
+        print(f"ERROR processing {filename}: {e}")
         traceback.print_exc()
-        raise
+        sys.stdout.flush()
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
-
-@router.get('/predict-by-path', summary="Recognize local image")
-def predict_by_path(image_path: str):
-    result = run_ocr(image_path)
-    return RestfulModel(resultcode=200, message="Success", data=result)
-
-
-@router.post('/predict-by-base64', summary="Recognize Base64 data")
-def predict_by_base64(base64model: Base64PostModel):
-    img = base64_to_ndarray(base64model.base64_str)
-    result = run_ocr(img)
-    return RestfulModel(resultcode=200, message="Success", data=result)
-
-
-@router.post('/predict-by-file', summary="Recognize uploaded file")
-async def predict_by_file(file: UploadFile):
-    filename = (file.filename or "upload").lower()
-    file_bytes = file.file.read()
-
-    if filename.endswith((".jpg", ".png", ".jpeg", ".bmp", ".tiff", ".webp")):
-        # Image file
-        img = bytes_to_ndarray(file_bytes)
-        result = run_ocr(img)
-    elif filename.endswith(".pdf"):
-        # PDF file — save to temp, PaddleOCR handles multi-page natively
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
+    finally:
+        # Cleanup temp files
         try:
-            result = run_ocr(tmp_path)
-        finally:
             os.remove(tmp_path)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Supported formats: .jpg, .png, .jpeg, .bmp, .tiff, .webp, .pdf"
-        )
-
-    return RestfulModel(resultcode=200, message=file.filename or "upload", data=result)
+        except OSError:
+            pass
+        shutil.rmtree(viz_dir, ignore_errors=True)
 
 
-@router.post('/structure', summary="Structure analysis with layout recovery & annotation")
-async def structure_analysis(file: UploadFile):
-    """
-    Run PPStructure: layout analysis + OCR + recovery to DOCX.
-    Returns structured blocks, annotated image (base64), and DOCX download path.
-    """
-    filename = (file.filename or "document").strip()
-    file_bytes = file.file.read()
+# ════════════════════════════════════════════════════
+#  Markdown → PDF generation
+# ════════════════════════════════════════════════════
 
-    if filename.lower().endswith((".jpg", ".png", ".jpeg", ".bmp", ".tiff", ".webp")):
-        result = run_structure_analysis(file_bytes, filename)
-    elif filename.lower().endswith(".pdf"):
-        # For PDFs, convert first page to image using PyMuPDF
-        import fitz
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-        try:
-            doc = fitz.open(tmp_path)
-            all_blocks = []
-            all_text_parts = []
-            annotated_images = []
-            docx_path = None
-
-            for page_idx, page in enumerate(doc):
-                # Render page at 300 DPI
-                mat = fitz.Matrix(300 / 72, 300 / 72)
-                pix = page.get_pixmap(matrix=mat)
-                img_bytes = pix.tobytes("png")
-                page_name = f"{os.path.splitext(filename)[0]}_page{page_idx + 1}"
-
-                page_result = run_structure_analysis(img_bytes, page_name)
-                all_blocks.extend(page_result['blocks'])
-                all_text_parts.append(page_result['full_text'])
-                if page_result.get('annotated_image'):
-                    annotated_images.append(page_result['annotated_image'])
-                if page_result.get('docx_path') and docx_path is None:
-                    docx_path = page_result['docx_path']
+_PDF_CSS = """
+@page {
+    size: A4;
+    margin: 2cm;
+}
+body {
+    font-family: Helvetica, Arial, sans-serif;
+    font-size: 11pt;
+    line-height: 1.6;
+    color: #1a1a1a;
+}
+h1 { font-size: 22pt; margin-top: 0.5em; margin-bottom: 0.3em; color: #1a1a2e; border-bottom: 2px solid #4a4e69; padding-bottom: 4pt; }
+h2 { font-size: 17pt; margin-top: 0.5em; color: #22223b; }
+h3 { font-size: 14pt; margin-top: 0.4em; color: #4a4e69; }
+h4, h5, h6 { font-size: 12pt; margin-top: 0.3em; }
+p { margin: 0.3em 0; }
+table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+th, td { border: 1px solid #9a8c98; padding: 6pt 8pt; text-align: left; font-size: 10pt; }
+th { background-color: #f2e9e4; font-weight: bold; }
+code { font-family: monospace; background: #f0f0f0; padding: 1pt 3pt; font-size: 10pt; }
+pre { background: #f5f5f5; padding: 8pt; border-radius: 4pt; overflow: auto; font-size: 9pt; }
+blockquote { border-left: 3pt solid #9a8c98; margin-left: 0; padding-left: 10pt; color: #555; }
+hr { border: none; border-top: 1px solid #ccc; margin: 1em 0; }
+img { max-width: 100%; }
+"""
 
 
-            total_pages = len(doc)
-            doc.close()
-            result = {
-                'blocks': all_blocks,
-                'full_text': '\n\n--- Page Break ---\n\n'.join(all_text_parts),
-                'block_count': len(all_blocks),
-                'annotated_image': annotated_images[0] if annotated_images else None,
-                'annotated_pages': annotated_images,
-                'docx_path': docx_path,
-                'page_count': total_pages,
-            }
-        finally:
-            os.remove(tmp_path)
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Supported formats: .jpg, .png, .jpeg, .bmp, .tiff, .webp, .pdf"
-        )
+def _generate_pdf_from_markdown(md_text, output_path):
+    """Convert markdown text to a styled PDF file."""
+    import markdown as md_lib
+    from xhtml2pdf import pisa
 
-    # Build response
-    response = {
-        'status': 'ok',
-        'filename': filename,
-        'blocks': result['blocks'],
-        'full_text': result['full_text'],
-        'block_count': result['block_count'],
-        'annotated_image': result.get('annotated_image'),
-        'annotated_pages': result.get('annotated_pages', []),
-        'has_docx': result.get('docx_path') is not None,
-        'docx_filename': os.path.basename(result['docx_path']) if result.get('docx_path') else None,
-    }
-    return JSONResponse(content=response)
+    # Convert Markdown → HTML
+    html_body = md_lib.markdown(
+        md_text,
+        extensions=["tables", "fenced_code", "codehilite", "toc", "nl2br"]
+    )
+
+    # Wrap in a full HTML document with styling
+    full_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>{_PDF_CSS}</style>
+</head>
+<body>
+{html_body}
+</body>
+</html>"""
+
+    with open(output_path, "wb") as pdf_file:
+        pisa_status = pisa.CreatePDF(full_html, dest=pdf_file)
+
+    if pisa_status.err:
+        raise RuntimeError(f"PDF generation returned {pisa_status.err} error(s)")
 
 
-@router.get('/download/{filename}', summary="Download recovered DOCX")
-def download_docx(filename: str):
-    """Download a recovered DOCX file."""
-    # Search for the file in output directory
+@router.get("/download/{filename}")
+def download_file(filename: str):
+    """Download a generated file (markdown, pdf, etc)."""
     for root, dirs, files in os.walk(OUTPUT_DIR):
         if filename in files:
-            filepath = os.path.join(root, filename)
+            file_path = os.path.join(root, filename)
+            if filename.endswith(".md"):
+                media_type = "text/markdown"
+            elif filename.endswith(".pdf"):
+                media_type = "application/pdf"
+            else:
+                media_type = "application/octet-stream"
             return FileResponse(
-                filepath,
-                media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                path=file_path,
                 filename=filename,
+                media_type=media_type
             )
-    raise HTTPException(status_code=404, detail=f"File {filename} not found")
 
-
-@router.get('/predict-by-url', summary="Recognize image URL")
-async def predict_by_url(imageUrl: str):
-    response = requests.get(imageUrl, timeout=30)
-    image_bytes = response.content
-
-    if not (image_bytes[:3] == b"\xff\xd8\xff" or image_bytes[:8] == b"\x89PNG\r\n\x1a\n"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="URL must point to a JPG or PNG image"
-        )
-
-    img = bytes_to_ndarray(image_bytes)
-    result = run_ocr(img)
-    return RestfulModel(resultcode=200, message="Success", data=result)
+    raise HTTPException(status_code=404, detail=f"File '{filename}' not found")

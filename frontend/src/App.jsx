@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import Header from './components/Header';
 import KnowledgeBase from './components/KnowledgeBase';
 import Chat from './components/Chat';
@@ -37,6 +37,40 @@ function App() {
   const [gpuMode, setGpuMode] = useState('rag'); // 'rag' or 'digitize'
   const [isSwitchingMode, setIsSwitchingMode] = useState(false);
   const switchingRef = useRef(false);
+  const [splitRatio, setSplitRatio] = useState(36); // KB panel width %
+  const isDragging = useRef(false);
+  const containerRef = useRef(null);
+
+  // ── Draggable splitter handlers ──
+  const handleSplitterMouseDown = useCallback((e) => {
+    e.preventDefault();
+    isDragging.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  }, []);
+
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (!isDragging.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const pct = (x / rect.width) * 100;
+      setSplitRatio(Math.min(60, Math.max(20, pct))); // clamp 20-60%
+    };
+    const handleMouseUp = () => {
+      if (isDragging.current) {
+        isDragging.current = false;
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      }
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
 
   const handleViewChange = useCallback(async (newView) => {
     if (newView === activeView) return;
@@ -134,17 +168,6 @@ function App() {
           <span>Chat</span>
         </button>
         <button
-          className={`view-tab ${activeView === 'digitize' ? 'active' : ''}`}
-          onClick={() => handleViewChange('digitize')}
-          id="view-tab-digitize"
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
-            <path d="M3 7V5a2 2 0 012-2h2m10 0h2a2 2 0 012 2v2m0 10v2a2 2 0 01-2 2h-2M3 17v2a2 2 0 002 2h2"/>
-            <line x1="7" y1="12" x2="17" y2="12"/>
-          </svg>
-          <span>Digitize</span>
-        </button>
-        <button
           className={`view-tab ${activeView === 'graph' ? 'active' : ''}`}
           onClick={() => handleViewChange('graph')}
           id="view-tab-graph"
@@ -158,20 +181,48 @@ function App() {
           <span>Knowledge Graph</span>
           {isIndexing && <span className="kg-indexing-badge">●</span>}
         </button>
+        <button
+          className={`view-tab ${activeView === 'digitize' ? 'active' : ''}`}
+          onClick={() => handleViewChange('digitize')}
+          id="view-tab-digitize"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+            <path d="M3 7V5a2 2 0 012-2h2m10 0h2a2 2 0 012 2v2m0 10v2a2 2 0 01-2 2h-2M3 17v2a2 2 0 002 2h2"/>
+            <line x1="7" y1="12" x2="17" y2="12"/>
+          </svg>
+          <span>Digitize</span>
+        </button>
       </div>
 
-      {/* Main content - KnowledgeBase is always mounted to preserve state */}
-      <main className={`container ${activeView === 'graph' ? 'container-graph' : ''}`}>
-        {/* Left Column - Knowledge Base (always rendered, never unmounts) */}
-        <KnowledgeBase
-          uploadedFiles={uploadedFiles}
-          setUploadedFiles={setUploadedFiles}
-          showToast={showToast}
-          addMessage={addMessage}
-          onIndexingChange={setIsIndexing}
-        />
+      {/* Main content */}
+      <main
+        ref={containerRef}
+        className={`container ${activeView === 'graph' ? 'container-graph' : ''} ${activeView === 'digitize' ? 'container-digitize' : ''}`}
+        style={activeView === 'chat' ? { gridTemplateColumns: `${splitRatio}% 6px 1fr` } : undefined}
+      >
+        {/* Left Column - Knowledge Base (hidden in digitize mode) */}
+        <div style={{ display: activeView === 'digitize' ? 'none' : 'contents' }}>
+          <KnowledgeBase
+            uploadedFiles={uploadedFiles}
+            setUploadedFiles={setUploadedFiles}
+            showToast={showToast}
+            addMessage={addMessage}
+            onIndexingChange={setIsIndexing}
+          />
+        </div>
 
-        {/* Right Column - Chat is always mounted to preserve streaming state */}
+        {/* Draggable Splitter — only in chat view */}
+        {activeView === 'chat' && (
+          <div
+            className="panel-splitter"
+            onMouseDown={handleSplitterMouseDown}
+            title="Drag to resize"
+          >
+            <div className="panel-splitter-line" />
+          </div>
+        )}
+
+        {/* Right Column - Chat */}
         <div style={{ display: activeView === 'chat' ? 'contents' : 'none' }}>
           <Chat
             messages={messages}

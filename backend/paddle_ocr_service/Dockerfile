@@ -5,25 +5,34 @@ WORKDIR /app
 
 # Prevent interactive prompts during apt install
 ENV DEBIAN_FRONTEND=noninteractive
+# Suppress paddle/paddlex logging noise
+ENV GLOG_minloglevel=2
 
 # Install Python 3.10 and system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3.10 python3.10-venv python3-pip \
-        libgl1 libgomp1 libglib2.0-0 libsm6 libxrender1 libxext6 && \
+        python3.10 python3.10-venv python3-pip python3.10-dev \
+        libgl1 libgomp1 libglib2.0-0 libsm6 libxrender1 libxext6 \
+        libcairo2-dev pkg-config \
+        wget curl && \
     ln -sf /usr/bin/python3.10 /usr/bin/python && \
     ln -sf /usr/bin/python3.10 /usr/bin/python3 && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies (ordered for compatibility)
-COPY requirements.txt /app/requirements.txt
+# ── Step 1: Install PaddlePaddle GPU 3.x for CUDA 11.8 ──
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir "numpy<2.0.0" && \
-    pip install --no-cache-dir paddlepaddle-gpu==2.6.1.post117 -f https://www.paddlepaddle.org.cn/whl/linux/mkl/avx/stable.html && \
-    pip install --no-cache-dir paddleocr==2.9.1 && \
-    pip install --no-cache-dir PyMuPDF && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir "numpy>=1.24,<2.0.0"
+    pip install --no-cache-dir paddlepaddle-gpu==3.3.0 \
+        -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+
+# ── Step 2: Install PaddleX (PP-StructureV3 pipeline framework) ──
+RUN pip install --no-cache-dir "paddlex[ocr]"
+
+# ── Step 3: Install remaining Python dependencies ──
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create output directory
+RUN mkdir -p /app/ocr_output
 
 # Copy project files
 COPY . /app

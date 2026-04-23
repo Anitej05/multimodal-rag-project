@@ -102,16 +102,19 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
     }
   }, [ocrResult, showToast]);
 
-  const handleDownloadDocx = useCallback(() => {
-    if (!ocrResult?.docx_filename) return;
-    const url = `${API_BASE_URL}/ocr/download/${ocrResult.docx_filename}`;
+  const handleDownloadMarkdown = useCallback(() => {
+    if (!ocrResult?.markdown) return;
+    const blob = new Blob([ocrResult.markdown], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
+    const name = (ocrResult.filename || 'document').replace(/\.[^.]+$/, '');
     a.href = url;
-    a.download = ocrResult.docx_filename;
+    a.download = `${name}_structured.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    if (showToast) showToast('Downloading structured DOCX...', 'success');
+    URL.revokeObjectURL(url);
+    if (showToast) showToast('Downloading structured Markdown...', 'success');
   }, [ocrResult, showToast]);
 
   const handleExportTxt = useCallback(() => {
@@ -211,7 +214,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
         <div className="dg-toolbar-right">
           <div className={`dg-service-badge ${ocrOnline === true ? 'online' : ocrOnline === false ? 'offline' : ''}`}>
             <span className="dg-service-dot" />
-            <span>{ocrOnline === true ? 'OCR Online (GPU)' : ocrOnline === false ? 'OCR Offline' : 'Checking...'}</span>
+            <span>{ocrOnline === true ? 'PP-StructureV3 (GPU)' : ocrOnline === false ? 'OCR Offline' : 'Checking...'}</span>
           </div>
         </div>
       </div>
@@ -244,7 +247,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                 {selectedFile ? 'Upload another file' : 'Drop image or PDF here or click to browse'}
               </div>
               <div className="dg-upload-hint">
-                PPStructure: Layout analysis + OCR + Structured DOCX recovery
+                PP-StructureV3: Layout + OCR + Tables + Formulas → Markdown + PDF
               </div>
               <div className="dg-upload-formats">
                 <span className="dg-format-badge">PDF</span>
@@ -329,9 +332,23 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                   >
                     {copied ? '✓ Copied' : '📋 Copy'}
                   </button>
-                  {ocrResult.has_docx && ocrResult.docx_filename && (
-                    <button className="dg-action-btn dg-docx-btn" onClick={handleDownloadDocx} id="dg-docx-btn">
-                      📄 Download .docx
+                  {ocrResult.has_markdown && ocrResult.markdown && (
+                    <button className="dg-action-btn dg-docx-btn" onClick={handleDownloadMarkdown} id="dg-md-btn">
+                      📝 Download .md
+                    </button>
+                  )}
+                  {ocrResult.has_pdf && ocrResult.pdf_filename && (
+                    <button className="dg-action-btn dg-docx-btn" onClick={() => {
+                      const url = `${API_BASE_URL}/ocr/download/${ocrResult.pdf_filename}`;
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = ocrResult.pdf_filename;
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                      if (showToast) showToast('Downloading structured PDF...', 'success');
+                    }} id="dg-pdf-btn">
+                      📄 Download PDF
                     </button>
                   )}
                   <button className="dg-action-btn" onClick={handleExportTxt} id="dg-export-btn">
@@ -359,7 +376,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                   className={`dg-results-tab ${resultView === 'full' ? 'active' : ''}`}
                   onClick={() => setResultView('full')}
                 >
-                  Full Text
+                  📝 Markdown
                 </button>
                 <button
                   className={`dg-results-tab ${resultView === 'blocks' ? 'active' : ''}`}
@@ -404,8 +421,27 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                     )}
                   </div>
                 ) : resultView === 'full' ? (
-                  <div className="dg-full-text">
-                    {ocrResult.full_text || '(No text extracted)'}
+                  <div className="dg-markdown-view">
+                    {ocrResult.markdown ? (
+                      <div
+                        className="dg-markdown-rendered"
+                        dangerouslySetInnerHTML={{ __html: ocrResult.markdown
+                          .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" class="dg-md-img" />')
+                          .replace(/^### (.*$)/gm, '<h3>$1</h3>')
+                          .replace(/^## (.*$)/gm, '<h2>$1</h2>')
+                          .replace(/^# (.*$)/gm, '<h1>$1</h1>')
+                          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                          .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                          .replace(/`(.*?)`/g, '<code>$1</code>')
+                          .replace(/^---$/gm, '<hr/>')
+                          .replace(/^- (.*$)/gm, '<li>$1</li>')
+                          .replace(/\n\n/g, '<br/><br/>')
+                          .replace(/\n/g, '<br/>')
+                        }}
+                      />
+                    ) : (
+                      <div style={{ opacity: 0.5 }}>(No markdown output)</div>
+                    )}
                   </div>
                 ) : (
                   <div className="dg-blocks-list">
@@ -435,9 +471,9 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
           ) : (
             <div className="dg-empty-state">
               <span className="dg-empty-icon">📜</span>
-              <div className="dg-empty-title">No OCR results yet</div>
+              <div className="dg-empty-title">No results yet</div>
               <div className="dg-empty-subtitle">
-                Upload an image or PDF and click "Scan & Extract Structure" to digitize using PPStructure with layout recovery.
+                Upload an image or PDF and click "Scan & Extract Structure" to digitize using PP-StructureV3 with layout analysis, formula recognition, and Markdown output.
               </div>
             </div>
           )}

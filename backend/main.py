@@ -1913,16 +1913,26 @@ async def ocr_upload(file: UploadFile = File(...)):
 
 @app.get('/ocr/download/{filename}')
 def ocr_download(filename: str):
-    """Proxy DOCX download from the OCR service."""
+    """Proxy file download from the OCR service (PDF, Markdown, etc)."""
     try:
         r = requests.get(f"{PADDLE_OCR_URL}/ocr/download/{filename}", timeout=30, stream=True)
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail="File not found")
 
+        # Detect media type from filename
+        if filename.endswith('.pdf'):
+            media_type = 'application/pdf'
+        elif filename.endswith('.md'):
+            media_type = 'text/markdown'
+        elif filename.endswith('.docx'):
+            media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        else:
+            media_type = 'application/octet-stream'
+
         from starlette.responses import Response
         return Response(
             content=r.content,
-            media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            media_type=media_type,
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
     except requests.exceptions.ConnectionError:

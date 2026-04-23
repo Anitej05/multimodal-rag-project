@@ -156,7 +156,7 @@ body::after {
   padding: 0 16px;
   display: grid;
   grid-template-columns: 1.8fr 3.2fr;
-  gap: 16px;
+  gap: 0;
   align-items: stretch;
   height: calc(100vh - 138px);
 }
@@ -164,6 +164,50 @@ body::after {
 /* Graph view container */
 .container-graph {
   height: calc(100vh - 138px);
+}
+
+/* Digitize view — full width, no KB sidebar */
+.container-digitize {
+  grid-template-columns: 1fr !important;
+  height: calc(100vh - 138px);
+}
+
+/* ── Draggable Panel Splitter ── */
+.panel-splitter {
+  width: 6px;
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  z-index: 10;
+  transition: background 0.2s;
+  margin: 8px 0;
+}
+
+.panel-splitter:hover,
+.panel-splitter:active {
+  background: rgba(99,102,241,0.08);
+}
+
+.panel-splitter-line {
+  width: 3px;
+  height: 48px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.1);
+  transition: all 0.2s ease;
+}
+
+.panel-splitter:hover .panel-splitter-line {
+  height: 72px;
+  background: linear-gradient(180deg, rgba(99,102,241,0.6), rgba(139,92,246,0.6));
+  box-shadow: 0 0 8px rgba(99,102,241,0.3);
+}
+
+.panel-splitter:active .panel-splitter-line {
+  height: 100%;
+  background: linear-gradient(180deg, rgba(99,102,241,0.8), rgba(139,92,246,0.8));
+  box-shadow: 0 0 12px rgba(99,102,241,0.5);
 }
 
 /* ── View Switcher ── */
