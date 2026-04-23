@@ -44,10 +44,12 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 18px;
-  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
-  border-bottom: 1px solid var(--border);
+  padding: 14px 22px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01));
+  border-bottom: 1px solid rgba(255,255,255,0.06);
   flex-shrink: 0;
+  position: relative;
+  z-index: 2;
 }
 
 .dg-toolbar-left {
@@ -59,14 +61,29 @@
 .dg-toolbar-title {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 14px;
+  gap: 10px;
+  font-size: 15px;
   font-weight: 700;
   color: #f1f5f9;
+  letter-spacing: -0.01em;
 }
 
-.dg-toolbar-icon {
-  font-size: 18px;
+.dg-toolbar-title svg {
+  color: #a5b4fc;
+  flex-shrink: 0;
+}
+
+.dg-engine-badge {
+  display: inline-flex;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: linear-gradient(135deg, rgba(99,102,241,0.15), rgba(139,92,246,0.15));
+  color: #a5b4fc;
+  border: 1px solid rgba(99,102,241,0.2);
 }
 
 .dg-toolbar-right {
@@ -125,11 +142,31 @@
 
 /* ── Left Panel (Upload + Preview) ── */
 .dg-left-panel {
-  width: 30%;
+  width: 28%;
+  min-width: 260px;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--border);
   min-height: 0;
+  background: rgba(0,0,0,0.08);
+}
+
+/* ── Right Panel (Results) ── */
+.dg-right-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  width: 0; /* forces flex-grow to fill remaining space */
+}
+
+.dg-results-content {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .dg-upload-section {
@@ -680,59 +717,6 @@
   color: #1e293b;
 }
 
-/* ── Annotated Image View ── */
-.dg-annotated-view {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-}
-
-.dg-annotated-img {
-  max-width: 100%;
-  max-height: 70vh;
-  border-radius: 10px;
-  border: 1px solid rgba(255,255,255,0.06);
-  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-  object-fit: contain;
-}
-
-/* ── Page Navigation ── */
-.dg-page-nav {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 6px 12px;
-  border-radius: 8px;
-  background: rgba(255,255,255,0.03);
-  border: 1px solid rgba(255,255,255,0.06);
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.dg-page-nav button {
-  padding: 4px 12px;
-  border-radius: 6px;
-  border: 1px solid rgba(255,255,255,0.08);
-  background: rgba(99,102,241,0.08);
-  color: #a5b4fc;
-  font-size: 11px;
-  font-weight: 700;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.dg-page-nav button:hover:not(:disabled) {
-  background: rgba(99,102,241,0.15);
-  color: #c4b5fd;
-}
-
-.dg-page-nav button:disabled {
-  opacity: 0.3;
-  cursor: not-allowed;
-}
-
 /* ── Type Dot (Layout Block indicator) ── */
 .dg-type-dot {
   display: inline-block;
@@ -894,39 +878,36 @@
    ═══════════════════════════════════════════════ */
 
 .dg-annotated-view {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 16px;
-  overflow-y: auto;
-  flex: 1;
-  min-height: 0;
-  background: linear-gradient(180deg, rgba(0,0,0,0.15), rgba(0,0,0,0.05));
+  width: 100%;
+  padding: 0;
 }
 
 .dg-annotated-img {
-  max-width: 100%;
-  width: auto;
+  width: 100%;
   height: auto;
-  object-fit: contain;
-  border-radius: 10px;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.05);
-  transition: transform 0.3s ease;
+  display: block;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .dg-annotated-img:hover {
-  transform: scale(1.02);
+  box-shadow: none;
 }
 
 .dg-page-nav {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 16px;
-  margin-top: 14px;
-  padding: 8px 16px;
-  background: rgba(255,255,255,0.04);
-  border-radius: 999px;
-  border: 1px solid rgba(255,255,255,0.06);
+  padding: 10px 20px;
+  background: rgba(15,18,35,0.85);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid rgba(255,255,255,0.06);
+  border-radius: 0;
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  margin-top: 0;
 }
 
 .dg-page-nav button {
@@ -1013,6 +994,9 @@
   font-size: 12px;
   font-weight: 600;
   transition: all 0.2s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .dg-results-tab:hover {
@@ -1244,4 +1228,22 @@
   background: rgba(99,102,241,0.06);
   color: #6366f1;
   border-color: rgba(99,102,241,0.1);
+}
+
+.light-theme .dg-engine-badge {
+  background: linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.1));
+  color: #6366f1;
+  border-color: rgba(99,102,241,0.15);
+}
+
+.light-theme .dg-toolbar-title svg { color: #6366f1; }
+.light-theme .dg-results-title svg { color: #059669; }
+
+.light-theme .dg-left-panel {
+  background: rgba(0,0,0,0.02);
+}
+
+.light-theme .dg-scan-btn {
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  color: white;
 }
