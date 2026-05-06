@@ -1281,6 +1281,7 @@ async def chat(payload: ChatRequest):
 4. End with --%Sources%-- separator
 5. Follow with proper sources section in HTML format
 6. If images are provided, describe and reference them in your response
+7. If 
 
 **SOURCE SELECTION CRITERIA:**
 - ONLY include sources that directly contribute to answering the user's query
