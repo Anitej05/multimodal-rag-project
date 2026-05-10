@@ -16,6 +16,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
   const [dragOver, setDragOver] = useState(false);
   const [currentPage, setCurrentPage] = useState(0);
   const [isIngesting, setIsIngesting] = useState(false);
+  const [imageDimensions, setImageDimensions] = useState(null);
   const fileInputRef = useRef(null);
 
   // Check OCR service health on mount
@@ -23,7 +24,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
     const checkHealth = async () => {
       try {
         const data = await api.ocrHealth();
-        setOcrOnline(data.status === 'ok');
+        setOcrOnline(data.ready === true);
       } catch {
         setOcrOnline(false);
       }
@@ -41,11 +42,20 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
       return;
     }
     setSelectedFile(file);
-    setPreviewUrl(file.type === 'application/pdf' ? null : URL.createObjectURL(file));
     setOcrResult(null);
     setError(null);
     setCopied(false);
     setCurrentPage(0);
+    setImageDimensions(null);
+    if (file.type === 'application/pdf') {
+      setPreviewUrl(null);
+    } else {
+      const url = URL.createObjectURL(file);
+      setPreviewUrl(url);
+      const img = new Image();
+      img.onload = () => setImageDimensions({ width: img.naturalWidth, height: img.naturalHeight });
+      img.src = url;
+    }
   }, []);
 
   const handleDrop = useCallback((e) => {
@@ -84,15 +94,15 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
   };
 
   const handleCopy = useCallback(async () => {
-    if (!ocrResult?.full_text) return;
+    if (!ocrResult?.markdown) return;
     try {
-      await navigator.clipboard.writeText(ocrResult.full_text);
+      await navigator.clipboard.writeText(ocrResult.markdown);
       setCopied(true);
-      if (showToast) showToast('Text copied to clipboard', 'success');
+      if (showToast) showToast('Markdown copied to clipboard', 'success');
       setTimeout(() => setCopied(false), 2000);
     } catch {
       const ta = document.createElement('textarea');
-      ta.value = ocrResult.full_text;
+      ta.value = ocrResult.markdown;
       document.body.appendChild(ta);
       ta.select();
       document.execCommand('copy');
@@ -118,8 +128,8 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
   }, [ocrResult, showToast]);
 
   const handleExportTxt = useCallback(() => {
-    if (!ocrResult?.full_text) return;
-    const blob = new Blob([ocrResult.full_text], { type: 'text/plain' });
+    if (!ocrResult?.markdown) return;
+    const blob = new Blob([ocrResult.markdown], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -131,14 +141,24 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
     if (showToast) showToast('Text exported as .txt', 'success');
   }, [ocrResult, showToast]);
 
+  const handleDownloadPdf = useCallback(() => {
+    if (!ocrResult?.pdf_file) return;
+    const url = `${API_BASE_URL}/ocr/download/${ocrResult.pdf_file}`;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(ocrResult.filename || 'document').replace(/\.[^.]+$/, '')}_structured.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    if (showToast) showToast('Downloading structured PDF...', 'success');
+  }, [ocrResult, showToast]);
+
   const handleIngest = useCallback(async () => {
-    if (!ocrResult?.full_text) return;
+    if (!ocrResult?.markdown) return;
     setIsIngesting(true);
     try {
-      // Save digitized text to uploads directory via /save-file
-      const textContent = ocrResult.full_text;
       const filename = `${(ocrResult.filename || 'digitized').replace(/\.[^.]+$/, '')}_digitized.txt`;
-      const blob = new Blob([textContent], { type: 'text/plain' });
+      const blob = new Blob([ocrResult.markdown], { type: 'text/plain' });
       const file = new File([blob], filename, { type: 'text/plain' });
 
       const fd = new FormData();
@@ -179,49 +199,81 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
     setError(null);
     setCopied(false);
     setCurrentPage(0);
+    setImageDimensions(null);
   };
 
   const getTypeColor = (type) => {
     const colors = {
-      'text': '#4ade80',
-      'title': '#a78bfa',
-      'table': '#38bdf8',
-      'figure': '#fb923c',
-      'list': '#f472b6',
-      'header': '#fbbf24',
-      'footer': '#94a3b8',
+      'text': '#60a5fa', 'title': '#c084fc', 'formula': '#f472b6',
+      'table': '#34d399', 'figure': '#fbbf24', 'list': '#fb923c',
+      'heading_1': '#c084fc', 'heading_2': '#a78bfa', 'heading_3': '#818cf8',
     };
-    return colors[type?.toLowerCase()] || '#e2e8f0';
+    return colors[type?.toLowerCase()] || '#94a3b8';
   };
 
-  // Get annotated images (array for multi-page PDFs)
-  const annotatedPages = ocrResult?.annotated_pages?.length > 0
-    ? ocrResult.annotated_pages
+  const getTypeIcon = (type) => {
+    const icons = {
+      'text': 'T', 'title': 'H', 'formula': 'fx', 'table': '#',
+      'figure': '▣', 'heading_1': 'H1', 'heading_2': 'H2', 'heading_3': 'H3',
+    };
+    return icons[type?.toLowerCase()] || '?';
+  };
+
+  const formatFileSize = (bytes) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const getFileTypeLabel = (file) => {
+    if (!file) return '';
+    const map = {
+      'application/pdf': 'PDF Document',
+      'image/jpeg': 'JPEG Image',
+      'image/png': 'PNG Image',
+      'image/bmp': 'BMP Image',
+      'image/tiff': 'TIFF Image',
+      'image/webp': 'WebP Image',
+    };
+    return map[file.type] || file.type || 'File';
+  };
+
+  const annotatedPages = ocrResult?.annotated_images?.length > 0
+    ? ocrResult.annotated_images
     : ocrResult?.annotated_image
       ? [ocrResult.annotated_image]
       : [];
 
+  const stats = ocrResult ? {
+    blocks: ocrResult.block_count || 0,
+    pages: ocrResult.page_count || 1,
+    figures: ocrResult.blocks?.filter(b => b.type === 'figure').length || 0,
+    formulas: ocrResult.blocks?.filter(b => b.type === 'formula').length || 0,
+    tables: ocrResult.blocks?.filter(b => b.type === 'table').length || 0,
+  } : null;
+
   return (
     <div className="digitize-container" id="digitize-container">
-      {/* ── Toolbar ── */}
-      <div className="dg-toolbar">
-        <div className="dg-toolbar-left">
-          <div className="dg-toolbar-title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+      {/* ── Header ── */}
+      <div className="dg-header">
+        <div className="dg-header-left">
+          <div className="dg-logo-mark">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" width="20" height="20">
               <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
               <polyline points="14 2 14 8 20 8"/>
-              <line x1="16" y1="13" x2="8" y2="13"/>
-              <line x1="16" y1="17" x2="8" y2="17"/>
-              <polyline points="10 9 9 9 8 9"/>
+              <path d="M9 15l2 2 4-4"/>
             </svg>
-            <span>Document Digitizer</span>
-            <span className="dg-engine-badge">PP-StructureV3</span>
           </div>
+          <span className="dg-header-title">Digitize</span>
+          <span className="dg-engine-badge">
+            <span className="dg-badge-dot" />
+            PaddleOCR
+          </span>
         </div>
-        <div className="dg-toolbar-right">
-          <div className={`dg-service-badge ${ocrOnline === true ? 'online' : ocrOnline === false ? 'offline' : ''}`}>
-            <span className="dg-service-dot" />
-            <span>{ocrOnline === true ? 'Engine Online · GPU' : ocrOnline === false ? 'Engine Offline' : 'Connecting...'}</span>
+        <div className="dg-header-right">
+          <div className={`dg-status-pill ${ocrOnline === true ? 'online' : ocrOnline === false ? 'offline' : ''}`}>
+            <span className="dg-status-dot" />
+            <span>{ocrOnline === true ? 'Engine Ready' : ocrOnline === false ? 'Offline' : 'Connecting...'}</span>
           </div>
         </div>
       </div>
@@ -242,27 +294,34 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
         <div className="dg-left-panel">
           <div className="dg-upload-section">
             <div
-              className={`dg-upload-zone ${dragOver ? 'drag-over' : ''}`}
+              className={`dg-upload-zone ${dragOver ? 'drag-over' : ''} ${selectedFile ? 'has-file' : ''}`}
               onClick={() => fileInputRef.current?.click()}
               onDrop={handleDrop}
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               id="dg-upload-zone"
             >
-              <span className="dg-upload-icon">🔍</span>
-              <div className="dg-upload-text">
-                {selectedFile ? 'Upload another file' : 'Drop image or PDF here or click to browse'}
-              </div>
-              <div className="dg-upload-hint">
-                PP-StructureV3: Layout + OCR + Tables + Formulas → Markdown + PDF
-              </div>
-              <div className="dg-upload-formats">
-                <span className="dg-format-badge">PDF</span>
-                <span className="dg-format-badge">JPG</span>
-                <span className="dg-format-badge">PNG</span>
-                <span className="dg-format-badge">BMP</span>
-                <span className="dg-format-badge">WebP</span>
-                <span className="dg-format-badge">TIFF</span>
+              <div className="dg-upload-border-glow" />
+              <div className="dg-upload-inner">
+                <div className="dg-upload-icon-wrap">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="28" height="28">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                  </svg>
+                </div>
+                <div className="dg-upload-text">
+                  {selectedFile ? 'Replace file' : 'Drop your document here'}
+                </div>
+                <div className="dg-upload-subtext">
+                  or click to browse files
+                </div>
+                <div className="dg-upload-formats">
+                  <span className="dg-format-tag">PDF</span>
+                  <span className="dg-format-tag">JPG</span>
+                  <span className="dg-format-tag">PNG</span>
+                  <span className="dg-format-tag">WebP</span>
+                </div>
               </div>
               <input
                 ref={fileInputRef}
@@ -275,28 +334,61 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
             </div>
           </div>
 
-          {/* ── Preview ── */}
+          {/* File Info Card */}
+          {selectedFile && (
+            <div className="dg-file-info">
+              <div className="dg-file-info-icon">
+                {selectedFile.type === 'application/pdf' ? (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="18" height="18">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="18" height="18">
+                    <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
+                  </svg>
+                )}
+              </div>
+              <div className="dg-file-info-details">
+                <div className="dg-file-info-name">{selectedFile.name}</div>
+                <div className="dg-file-info-meta">
+                  <span className="dg-file-info-type">{getFileTypeLabel(selectedFile)}</span>
+                  <span className="dg-file-info-sep">·</span>
+                  <span>{formatFileSize(selectedFile.size)}</span>
+                  {imageDimensions && (
+                    <>
+                      <span className="dg-file-info-sep">·</span>
+                      <span>{imageDimensions.width} × {imageDimensions.height} px</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              <button className="dg-file-info-remove" onClick={handleClear} title="Remove file">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14">
+                  <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
+            </div>
+          )}
+
           {selectedFile && (
             <div className="dg-preview-section">
-              <div className="dg-preview-header">
-                <span className="dg-preview-filename">📄 {selectedFile.name}</span>
-                <button className="dg-preview-clear" onClick={handleClear}>✕ Clear</button>
-              </div>
               <div className="dg-preview-image-wrapper">
                 {previewUrl ? (
                   <img src={previewUrl} alt="Preview" />
                 ) : (
-                  <div className="dg-empty-state" style={{ padding: '20px' }}>
-                    <span style={{ fontSize: '40px' }}>📑</span>
-                    <span style={{ fontSize: '13px', color: '#e2e8f0', marginTop: '8px', fontWeight: 600 }}>{selectedFile.name}</span>
-                    <span style={{ fontSize: '11px', color: 'var(--muted-2)', marginTop: '4px' }}>PDF document ready for scanning</span>
+                  <div className="dg-pdf-preview">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" width="32" height="32">
+                      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                      <polyline points="14 2 14 8 20 8"/>
+                    </svg>
+                    <span>PDF Document</span>
                   </div>
                 )}
               </div>
             </div>
           )}
 
-          {/* ── Scan Button ── */}
           <div className="dg-scan-section">
             <button
               className={`dg-scan-btn ${isScanning ? 'scanning' : ''}`}
@@ -307,7 +399,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
               {isScanning ? (
                 <>
                   <span className="dg-scan-spinner" />
-                  <span>Analyzing structure...</span>
+                  <span>Analyzing layout...</span>
                 </>
               ) : (
                 <>
@@ -315,7 +407,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                     <path d="M3 7V5a2 2 0 012-2h2m10 0h2a2 2 0 012 2v2m0 10v2a2 2 0 01-2 2h-2M3 17v2a2 2 0 002 2h2"/>
                     <line x1="7" y1="12" x2="17" y2="12"/>
                   </svg>
-                  <span>Scan & Extract Structure</span>
+                  <span>Digitize Document</span>
                 </>
               )}
             </button>
@@ -326,54 +418,61 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
         <div className="dg-right-panel">
           {ocrResult ? (
             <>
-              <div className="dg-results-header">
-                <div className="dg-results-title">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
-                    <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>
-                  </svg>
-                  <span>Analysis Complete</span>
-                  <span className="dg-block-count">{ocrResult.block_count} regions</span>
-                  {ocrResult.page_count > 1 && (
-                    <span className="dg-block-count">{ocrResult.page_count} pages</span>
-                  )}
+              {/* Stats Bar */}
+              <div className="dg-stats-bar">
+                <div className="dg-stat-card">
+                  <span className="dg-stat-value">{stats.blocks}</span>
+                  <span className="dg-stat-label">Regions</span>
                 </div>
-                <div className="dg-results-actions">
-                  <button
-                    className={`dg-action-btn ${copied ? 'copied' : ''}`}
-                    onClick={handleCopy}
-                    id="dg-copy-btn"
-                  >
-                    {copied ? '✓ Copied' : '📋 Copy'}
+                <div className="dg-stat-card">
+                  <span className="dg-stat-value">{stats.pages}</span>
+                  <span className="dg-stat-label">Pages</span>
+                </div>
+                {stats.figures > 0 && (
+                  <div className="dg-stat-card dg-stat-amber">
+                    <span className="dg-stat-value">{stats.figures}</span>
+                    <span className="dg-stat-label">Figures</span>
+                  </div>
+                )}
+                {stats.formulas > 0 && (
+                  <div className="dg-stat-card dg-stat-pink">
+                    <span className="dg-stat-value">{stats.formulas}</span>
+                    <span className="dg-stat-label">Formulas</span>
+                  </div>
+                )}
+                {stats.tables > 0 && (
+                  <div className="dg-stat-card dg-stat-green">
+                    <span className="dg-stat-value">{stats.tables}</span>
+                    <span className="dg-stat-label">Tables</span>
+                  </div>
+                )}
+                <div className="dg-stats-actions">
+                  <button className={`dg-icon-btn ${copied ? 'copied' : ''}`} onClick={handleCopy} title="Copy markdown">
+                    {copied ? (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                        <path d="M9 11l3 3L22 4"/>
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                        <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                      </svg>
+                    )}
                   </button>
-                  {ocrResult.has_markdown && ocrResult.markdown && (
-                    <button className="dg-action-btn dg-docx-btn" onClick={handleDownloadMarkdown} id="dg-md-btn">
-                      📝 .md
-                    </button>
-                  )}
-                  {ocrResult.has_pdf && ocrResult.pdf_filename && (
-                    <button className="dg-action-btn dg-docx-btn" onClick={() => {
-                      const url = `${API_BASE_URL}/ocr/download/${ocrResult.pdf_filename}`;
-                      const a = document.createElement('a');
-                      a.href = url;
-                      a.download = ocrResult.pdf_filename;
-                      document.body.appendChild(a);
-                      a.click();
-                      document.body.removeChild(a);
-                      if (showToast) showToast('Downloading structured PDF...', 'success');
-                    }} id="dg-pdf-btn">
-                      📄 .pdf
-                    </button>
-                  )}
-                  <button className="dg-action-btn" onClick={handleExportTxt} id="dg-export-btn">
-                    💾 .txt
+                  <button className="dg-icon-btn dg-md-btn" onClick={handleDownloadMarkdown} title="Download .md">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
                   </button>
-                  <button
-                    className={`dg-action-btn dg-ingest-btn ${isIngesting ? 'ingesting' : ''}`}
-                    onClick={handleIngest}
-                    disabled={isIngesting}
-                    id="dg-ingest-btn"
-                  >
-                    {isIngesting ? '⏳ Ingesting...' : '🧠 Ingest to RAG'}
+                  <button className="dg-icon-btn dg-pdf-btn" onClick={handleDownloadPdf} disabled={!ocrResult?.pdf_file} title="Download PDF">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 8 9"/>
+                    </svg>
+                  </button>
+                  <button className="dg-icon-btn dg-ingest-icon-btn" onClick={handleIngest} disabled={isIngesting} title="Ingest to RAG">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                      <path d="M12 2a10 10 0 0110 10 10 10 0 01-10 10A10 10 0 012 12 10 10 0 0112 2z"/>
+                      <path d="M12 6v6l4 2"/>
+                    </svg>
                   </button>
                 </div>
               </div>
@@ -405,6 +504,15 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                     <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
                   </svg>
                   Layout Blocks
+                </button>
+                <button
+                  className={`dg-results-tab ${resultView === 'pdf' ? 'active' : ''}`}
+                  onClick={() => setResultView('pdf')}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 8 9"/>
+                  </svg>
+                  PDF
                 </button>
               </div>
 
@@ -465,25 +573,37 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                       <div style={{ opacity: 0.5 }}>(No markdown output)</div>
                     )}
                   </div>
+                ) : resultView === 'pdf' ? (
+                  <div className="dg-pdf-viewer">
+                    {ocrResult.pdf_file ? (
+                      <iframe
+                        src={`${API_BASE_URL}/ocr/download/${ocrResult.pdf_file}`}
+                        title="Structured PDF"
+                        className="dg-pdf-iframe"
+                        style={{ width: '100%', height: '600px', border: '1px solid #e5e7eb', borderRadius: '8px' }}
+                      />
+                    ) : (
+                      <div style={{ opacity: 0.6 }}>No PDF generated. Process a document first.</div>
+                    )}
+                  </div>
                 ) : (
                   <div className="dg-blocks-list">
                     {ocrResult.blocks?.map((block, idx) => (
-                      <div className="dg-block-item" key={idx}>
+                      <div className="dg-block-item" key={idx} style={{ borderLeftColor: getTypeColor(block.type) }}>
                         <div className="dg-block-header">
-                          <span className="dg-block-index">
-                            <span
-                              className="dg-type-dot"
-                              style={{ background: getTypeColor(block.type) }}
-                            />
-                            {block.type || 'text'}
+                          <span className="dg-block-type-tag" style={{ background: getTypeColor(block.type) + '18', color: getTypeColor(block.type) }}>
+                            {getTypeIcon(block.type)} {block.type || 'text'}
                           </span>
-                          {block.bbox && (
-                            <span className="dg-block-bbox">
-                              [{block.bbox.map(v => Math.round(v)).join(', ')}]
-                            </span>
+                          {block.score && block.score < 1.0 && (
+                            <span className="dg-block-score">{Math.round(block.score * 100)}%</span>
                           )}
                         </div>
                         <div className="dg-block-text">{block.text || '(empty)'}</div>
+                        {block.type === 'figure' && block.image && (
+                          <div className="dg-block-figure">
+                            <img src={`data:image/png;base64,${block.image}`} alt="Figure" />
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -492,10 +612,32 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
             </>
           ) : (
             <div className="dg-empty-state">
-              <span className="dg-empty-icon">📜</span>
-              <div className="dg-empty-title">No results yet</div>
+              <div className="dg-empty-graphic">
+                <div className="dg-empty-doc-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" width="48" height="48">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                    <line x1="16" y1="13" x2="8" y2="13" opacity="0.5"/>
+                    <line x1="16" y1="17" x2="8" y2="17" opacity="0.5"/>
+                    <line x1="10" y1="9" x2="8" y2="9" opacity="0.5"/>
+                  </svg>
+                </div>
+                <div className="dg-empty-scan-lines">
+                  <div className="dg-empty-scan-line" />
+                  <div className="dg-empty-scan-line" />
+                  <div className="dg-empty-scan-line" />
+                </div>
+              </div>
+              <div className="dg-empty-title">Ready to Digitize</div>
               <div className="dg-empty-subtitle">
-                Upload an image or PDF and click "Scan & Extract Structure" to digitize using PP-StructureV3 with layout analysis, formula recognition, and Markdown output.
+                Upload a document and extract text, tables, math formulas, and figures with PaddleOCR
+              </div>
+              <div className="dg-empty-features">
+                <span className="dg-feature-chip">Layout Analysis</span>
+                <span className="dg-feature-chip">Math Equations</span>
+                <span className="dg-feature-chip">Tables</span>
+                <span className="dg-feature-chip">Figures</span>
+                <span className="dg-feature-chip">Markdown</span>
               </div>
             </div>
           )}

@@ -40,6 +40,10 @@ except ImportError:
     KOKORO_AVAILABLE = False
     KPipeline = None  # type: ignore
 
+# PaddleOCR runs as a separate microservice on port 8011
+# (in its own conda env 'ocr' to avoid dependency conflicts)
+OCR_SERVICE_URL = os.environ.get("OCR_SERVICE_URL", "http://localhost:8011")
+
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
@@ -76,8 +80,17 @@ class ModelManager:
     """
     Manages GPU VRAM by dynamically loading/unloading models.
     Modes:
-      - "rag": embedding, cross-encoder, whisper loaded on GPU
-      - "digitize": all RAG models offloaded, GPU free for PaddleOCR
+      - "rag": embedding, cross-encoder, whisper, LM Studio loaded on GPU
+      - "digitize": all RAG models + LM Studio offloaded, PaddleOCR loaded on GPU
+
+    GPU memory budget (typical 8-12 GB VRAM):
+      RAG models:  ~3-4 GB  (embedding + cross-encoder + whisper)
+      LM Studio:   ~4-5 GB  (Qwen3.5-4B via external process)
+      PaddleOCR:  ~1-2 GB  (PP-Structure — text, tables, figures, layout analysis)
+
+    PaddleOCR + PP-Structure — industrial-grade OCR with layout analysis.
+    Detects text, tables, figures, titles, headers, footers, formulas.
+    Runs as a subprocess in its own conda env to avoid dependency conflicts.
     """
     def __init__(self):
         self.mode = "rag"
@@ -85,10 +98,11 @@ class ModelManager:
         self.embedding_model = None
         self.cross_encoder_model = None
         self.whisper_model = None
+        self.lm_studio_process = None  # subprocess handle for LM Studio
         self._load_rag_models()
 
     def _load_rag_models(self):
-        """Load all RAG models onto GPU."""
+        """Load all RAG models onto GPU + start LM Studio."""
         print("ModelManager: Loading RAG models on GPU...")
 
         print(f"  Loading embedding model from {EMB_MODEL_PATH}...")
@@ -116,48 +130,188 @@ class ModelManager:
             print(f"  Whisper failed to load: {e}")
             self.whisper_model = None
 
+        # Start LM Studio if not already running
+        self._start_lm_studio()
+
         self.mode = "rag"
         print("ModelManager: All RAG models loaded. Mode = rag")
 
     def _unload_rag_models(self):
-        """Unload all RAG models from GPU to free VRAM."""
+        """Unload all RAG models from GPU + stop LM Studio to free VRAM."""
         print("ModelManager: Unloading RAG models from GPU...")
         self.embedding_model = None
         self.cross_encoder_model = None
         self.whisper_model = None
+
+        # Stop LM Studio to free its GPU memory
+        self._stop_lm_studio()
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         import gc
         gc.collect()
         self.mode = "digitize"
-        print("ModelManager: RAG models unloaded. VRAM freed. Mode = digitize")
+        print("ModelManager: RAG models + LM Studio unloaded. VRAM freed. Mode = digitize")
 
     def switch_to_digitize(self):
-        """Switch to digitize mode — free GPU for OCR."""
+        """Switch to digitize mode — OCR is CPU-only so no GPU juggling needed.
+        Just ensure OCR service is running and return instantly."""
         with self.lock:
             if self.mode == "digitize":
                 return {"mode": "digitize", "status": "already_active"}
-            self._unload_rag_models()
+            # OCR runs on CPU — no need to unload RAG models from GPU
+            # Start OCR service in background thread so we return instantly
+            import threading
+            t = threading.Thread(target=self._start_ocr_service, daemon=True)
+            t.start()
+            self.mode = "digitize"
             return {"mode": "digitize", "status": "ready"}
 
     def switch_to_rag(self):
-        """Switch to RAG mode — reload models on GPU."""
+        """Switch to RAG mode — OCR stays running on CPU, just reload RAG models."""
         with self.lock:
             if self.mode == "rag":
                 return {"mode": "rag", "status": "already_active"}
+            # Reload RAG models (they may have been unloaded by previous logic)
             self._load_rag_models()
             return {"mode": "rag", "status": "ready"}
 
+    def _start_lm_studio(self):
+        """Start LM Studio server if it's not already running."""
+        # Check if LM Studio is already reachable
+        try:
+            r = requests.get(f"{LM_STUDIO_URL}/v1/models", timeout=3)
+            if r.status_code == 200:
+                print("ModelManager: LM Studio already running.")
+                return
+        except Exception:
+            pass
+
+        # Try to start LM Studio from common install paths
+        lm_studio_paths = [
+            os.path.expandvars(r"%LOCALAPPDATA%\LM Studio\lm-studio.exe"),
+            os.path.expandvars(r"%USERPROFILE%\AppData\Local\LM Studio\lm-studio.exe"),
+            "/usr/local/bin/lm-studio",
+            "lm-studio",
+        ]
+
+        for path in lm_studio_paths:
+            if os.path.exists(path) or path == "lm-studio":
+                try:
+                    print(f"ModelManager: Starting LM Studio from {path}...")
+                    self.lm_studio_process = subprocess.Popen(
+                        [path, "serve"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                    )
+                    print("ModelManager: LM Studio start command sent.")
+                    return
+                except Exception as e:
+                    print(f"ModelManager: Failed to start LM Studio: {e}")
+                    continue
+
+        print("ModelManager: Could not auto-start LM Studio. Please start it manually.")
+
+    def _stop_lm_studio(self):
+        """Stop LM Studio server to free GPU memory."""
+        if self.lm_studio_process is not None:
+            try:
+                self.lm_studio_process.terminate()
+                self.lm_studio_process.wait(timeout=10)
+                print("ModelManager: LM Studio process terminated.")
+            except Exception as e:
+                try:
+                    self.lm_studio_process.kill()
+                    print("ModelManager: LM Studio process killed.")
+                except Exception:
+                    pass
+            self.lm_studio_process = None
+        else:
+            print("ModelManager: LM Studio was not started by us — please stop it manually if needed.")
+
     def get_status(self):
+        # Check if LM Studio is reachable
+        lm_studio_online = False
+        try:
+            r = requests.get(f"{LM_STUDIO_URL}/v1/models", timeout=3)
+            lm_studio_online = r.status_code == 200
+        except Exception:
+            pass
+
+        ocr_online = False
+        try:
+            r = requests.get(f"{OCR_SERVICE_URL}/ocr/health", timeout=3)
+            ocr_online = r.status_code == 200 and r.json().get("ready", False)
+        except Exception:
+            pass
+
         return {
             "mode": self.mode,
             "embedding_loaded": self.embedding_model is not None,
             "cross_encoder_loaded": self.cross_encoder_model is not None,
             "whisper_loaded": self.whisper_model is not None,
+            "ocr_service_online": ocr_online,
+            "lm_studio_online": lm_studio_online,
             "gpu_available": torch.cuda.is_available(),
             "vram_allocated_mb": round(torch.cuda.memory_allocated() / 1024 / 1024, 1) if torch.cuda.is_available() else 0,
         }
+
+    def _start_ocr_service(self):
+        """Start the PaddleOCR microservice — fire and forget, no waiting."""
+        # Check if already running
+        try:
+            r = requests.get(f"{OCR_SERVICE_URL}/ocr/health", timeout=2)
+            if r.status_code == 200:
+                return
+        except Exception:
+            pass
+
+        ocr_script = os.path.join(os.path.dirname(__file__), "ocr_service.py")
+        conda_exe = os.path.expandvars(r"%CONDA_EXE%")
+        if not os.path.exists(conda_exe):
+            for candidate in [
+                os.path.expandvars(r"%USERPROFILE%\anaconda3\Scripts\conda.exe"),
+                os.path.expandvars(r"%USERPROFILE%\miniconda3\Scripts\conda.exe"),
+                os.path.expandvars(r"%LOCALAPPDATA%\anaconda3\Scripts\conda.exe"),
+                "conda",
+            ]:
+                if os.path.exists(candidate) or candidate == "conda":
+                    conda_exe = candidate
+                    break
+
+        try:
+            cmd = [conda_exe, "run", "-n", "ocr", "--no-banner",
+                   "python", ocr_script]
+            print(f"ModelManager: Starting OCR service: {' '.join(cmd)}")
+            self.ocr_service_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            print("ModelManager: OCR service start command sent (loading in background).")
+        except Exception as e:
+            print(f"ModelManager: Failed to start OCR service: {e}")
+
+    def _stop_ocr_service(self):
+        """Stop the OCR service subprocess."""
+        proc = getattr(self, 'ocr_service_process', None)
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+                print("ModelManager: OCR service process terminated.")
+            except Exception:
+                try:
+                    proc.kill()
+                    print("ModelManager: OCR service process killed.")
+                except Exception:
+                    pass
+            self.ocr_service_process = None
+        else:
+            print("ModelManager: OCR service was not started by us.")
 
 # Initialize the model manager (loads RAG models on startup)
 model_mgr = ModelManager()
@@ -1876,57 +2030,56 @@ def mode_status():
     """Get current mode and model status."""
     return model_mgr.get_status()
 
-# --- PaddleOCR Proxy ---
-PADDLE_OCR_URL = "http://localhost:8010"
-
+# --- PaddleOCR Document Digitization (proxied to OCR service on port 8011) ---
 @app.post('/ocr/upload')
 async def ocr_upload(file: UploadFile = File(...)):
     """
-    Proxy endpoint: forwards an uploaded file to the PaddleOCR PPStructure service.
-    Returns structured blocks, annotated image, and DOCX download info.
+    Proxy: forward uploaded file to the PaddleOCR service for processing.
+    Returns structured blocks, annotated images, and markdown output.
     """
     try:
         file_bytes = await file.read()
         filename = file.filename or "upload.png"
 
-        # Forward to PPStructure endpoint for full layout analysis
         ocr_response = requests.post(
-            f"{PADDLE_OCR_URL}/ocr/structure",
+            f"{OCR_SERVICE_URL}/ocr/process",
             files={"file": (filename, file_bytes, file.content_type or "image/png")},
             timeout=600
         )
 
         if ocr_response.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"OCR service returned {ocr_response.status_code}")
+            try:
+                detail = ocr_response.json().get("detail", "OCR service error")
+            except Exception:
+                detail = "OCR service error"
+            raise HTTPException(status_code=ocr_response.status_code, detail=detail)
 
         return ocr_response.json()
 
     except requests.exceptions.ConnectionError:
-        raise HTTPException(
-            status_code=503,
-            detail="PaddleOCR service is not running. Please start it on port 8010."
-        )
+        raise HTTPException(status_code=503, detail="OCR service not running. Switch to Digitize mode first.")
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=504, detail="OCR processing timed out.")
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
 
 
-@app.get('/ocr/download/{filename}')
-def ocr_download(filename: str):
-    """Proxy file download from the OCR service (PDF, Markdown, etc)."""
+@app.get('/ocr/download/{filepath:path}')
+def ocr_download(filepath: str):
+    """Proxy file download from the OCR service."""
     try:
-        r = requests.get(f"{PADDLE_OCR_URL}/ocr/download/{filename}", timeout=30, stream=True)
+        r = requests.get(f"{OCR_SERVICE_URL}/ocr/download/{filepath}", timeout=30, stream=True)
         if r.status_code != 200:
-            raise HTTPException(status_code=r.status_code, detail="File not found")
+            raise HTTPException(status_code=r.status_code, detail="File not found on OCR service")
 
-        # Detect media type from filename
-        if filename.endswith('.pdf'):
+        if filepath.endswith('.pdf'):
             media_type = 'application/pdf'
-        elif filename.endswith('.md'):
+        elif filepath.endswith('.md'):
             media_type = 'text/markdown'
-        elif filename.endswith('.docx'):
-            media_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         else:
             media_type = 'application/octet-stream'
 
@@ -1934,7 +2087,7 @@ def ocr_download(filename: str):
         return Response(
             content=r.content,
             media_type=media_type,
-            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+            headers={'Content-Disposition': f'attachment; filename="{os.path.basename(filepath)}"'}
         )
     except requests.exceptions.ConnectionError:
         raise HTTPException(status_code=503, detail="OCR service not reachable")
@@ -1942,12 +2095,23 @@ def ocr_download(filename: str):
 
 @app.get('/ocr/health')
 def ocr_health():
-    """Check if the PaddleOCR microservice is reachable."""
+    """Check if the PaddleOCR service is reachable and model is loaded."""
     try:
-        r = requests.get(f"{PADDLE_OCR_URL}/health", timeout=5)
-        return {"status": "ok", "ocr_service": r.json()}
+        r = requests.get(f"{OCR_SERVICE_URL}/ocr/health", timeout=5)
+        data = r.json()
+        return {
+            "status": data.get("status", "unknown"),
+            "engine": "PaddleOCR",
+            "ready": data.get("ready", False),
+            "message": None if data.get("ready") else "OCR model not loaded — switch to Digitize mode first",
+        }
     except Exception:
-        return {"status": "unavailable", "message": "PaddleOCR service not reachable on port 8010"}
+        return {
+            "status": "unavailable",
+            "engine": "PaddleOCR",
+            "ready": False,
+            "message": "OCR service not reachable — switch to Digitize mode to start it",
+        }
 
 if __name__ == '__main__':
     import uvicorn

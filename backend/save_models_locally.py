@@ -7,6 +7,7 @@ Expected directory structure after running:
     cross-encoder-minilm/      <- cross-encoder/ms-marco-MiniLM-L-6-v2
     faster-whisper-base/       <- Systran/faster-whisper-base
     kokoro-82m/                <- hexgrad/Kokoro-82M
+    deepseek-ocr-2/            <- deepseek-ai/DeepSeek-OCR-2
 
 Usage (run inside multimodal-rag conda env):
   python save_models_locally.py
@@ -53,11 +54,21 @@ else:
 # ── 4. Kokoro TTS ──
 kokoro_dir = os.path.join(MODELS_DIR, "kokoro-82m")
 if not os.path.exists(kokoro_dir) or len(os.listdir(kokoro_dir)) == 0:
-    print("[4/4] Saving Kokoro-82M...")
+    print("[4/5] Saving Kokoro-82M...")
     from huggingface_hub import snapshot_download
     snapshot_download("hexgrad/Kokoro-82M", local_dir=kokoro_dir)
     print(f"  Done -> {kokoro_dir}")
 else:
-    print("[4/4] Kokoro-82M already exists, skipping.")
+    print("[4/5] Kokoro-82M already exists, skipping.")
+
+# ── 5. DeepSeek-OCR-2 ──
+ocr_dir = os.path.join(MODELS_DIR, "deepseek-ocr-2")
+if not os.path.exists(os.path.join(ocr_dir, "config.json")):
+    print("[5/5] Saving DeepSeek-OCR-2...")
+    from huggingface_hub import snapshot_download
+    snapshot_download("deepseek-ai/DeepSeek-OCR-2", local_dir=ocr_dir, local_dir_use_symlinks=False, resume_download=True)
+    print(f"  Done -> {ocr_dir}")
+else:
+    print("[5/5] DeepSeek-OCR-2 already exists, skipping.")
 
 print("\nAll models saved to backend/models/")

@@ -82,14 +82,10 @@ function App() {
     if (needsDigitize && currentMode !== 'digitize') {
       if (switchingRef.current) return;
       switchingRef.current = true;
-      setIsSwitchingMode(true);
-      try {
-        await api.switchMode('digitize');
-        setGpuMode('digitize');
-      } catch (e) {
-        console.warn('Mode switch to digitize failed:', e);
-      }
-      setIsSwitchingMode(false);
+      // Digitize mode is instant — OCR runs on CPU, no GPU juggling
+      // Fire and forget, update mode state immediately
+      api.switchMode('digitize').catch(e => console.warn('Mode switch to digitize failed:', e));
+      setGpuMode('digitize');
       switchingRef.current = false;
     } else if (needsRag && currentMode !== 'rag') {
       if (switchingRef.current) return;
@@ -260,9 +256,9 @@ function App() {
             animation: 'spin 0.8s linear infinite'
           }} />
           <div style={{ color: '#e2e8f0', fontSize: '15px', fontWeight: 600 }}>
-            {gpuMode === 'rag' ? 'Loading OCR engine on GPU...' : 'Reloading RAG models on GPU...'}
+            {'Switching back to chat mode...'}
           </div>
-          <div style={{ color: '#94a3b8', fontSize: '12px' }}>Switching GPU mode</div>
+          <div style={{ color: '#94a3b8', fontSize: '12px' }}>Please wait</div>
         </div>
       )}
 
