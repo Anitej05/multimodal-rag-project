@@ -691,30 +691,35 @@ def retrieve_multimodal_context(query: str, top_k: int = 5) -> List[dict]:
     return top_results
 
 # --- Multimodal Message Builder ---
-def build_chat_messages(query: str, contexts: list, system_prompt: str) -> list:
+def build_chat_messages(query: str, contexts: list, system_prompt: str, source_to_citation: dict = None) -> list:
     """
     Build LM Studio chat messages with multimodal support.
-    If retrieved contexts include images, they are sent as base64 to Qwen3.5-4B
-    which natively understands both text and images.
+    Each context chunk is labeled with its citation number so the LLM
+    knows exactly which source maps to [1], [2], etc.
     """
     # Separate text and image contexts
-    text_parts = []
     image_parts = []
-    for ctx in contexts:
-        if ctx.get("type") == "image":
-            source_path = ctx["source"]
-            if os.path.exists(source_path):
-                image_parts.append(source_path)
-        else:
-            text_parts.append(ctx["text"])
+    labeled_chunks = []
 
-    context_str = "\n".join(text_parts)
+    for ctx in contexts:
+        source_path = ctx["source"]
+        citation_num = source_to_citation.get(source_path, "?") if source_to_citation else "?"
+        source_name = os.path.basename(source_path)
+
+        if ctx.get("type") == "image":
+            if os.path.exists(source_path):
+                image_parts.append((source_path, citation_num))
+                labeled_chunks.append(f"[SOURCE {citation_num}: {source_name}]\n(Image file — see attached image)")
+        else:
+            labeled_chunks.append(f"[SOURCE {citation_num}: {source_name}]\n{ctx['text']}")
+
+    context_str = "\n\n---\n\n".join(labeled_chunks)
 
     # Build the user message content
     user_content = []
 
     # Add images first so the model can see them
-    for img_path in image_parts:
+    for img_path, cit_num in image_parts:
         try:
             with open(img_path, 'rb') as img_file:
                 image_b64 = base64.b64encode(img_file.read()).decode('utf-8')
@@ -724,12 +729,12 @@ def build_chat_messages(query: str, contexts: list, system_prompt: str) -> list:
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{image_b64}"}
             })
-            print(f"DEBUG: Attached image {os.path.basename(img_path)} to LLM message")
+            print(f"DEBUG: Attached image {os.path.basename(img_path)} as source [{cit_num}]")
         except Exception as e:
             print(f"DEBUG: Failed to attach image {img_path}: {e}")
 
-    # Add the text prompt
-    prompt_text = f"CONTEXT:\n{context_str}\n\nUSER'S QUESTION: {query}" if context_str else f"USER'S QUESTION: {query}"
+    # Add the text prompt with labeled context
+    prompt_text = f"RETRIEVED SOURCES:\n\n{context_str}\n\n===\nQUESTION: {query}" if context_str else f"QUESTION: {query}"
     user_content.append({"type": "text", "text": prompt_text})
 
     messages = [
@@ -1394,14 +1399,9 @@ async def chat(payload: ChatRequest):
         return {"answer": "Knowledge base is empty. Please ingest files first."}
 
     try:
-        # Skip the judge step and directly use all contexts
         final_contexts = contexts
 
-        # GENERATE RESPONSE with all contexts
-        context_str = "\n".join([ctx['text'] for ctx in final_contexts])
-        unique_sources = list(set([ctx["source"] for ctx in final_contexts]))
-        
-        # Create a consistent mapping of source paths to citation numbers
+        # Create a deterministic, ordered mapping: first-seen source → citation number
         source_to_citation = {}
         citation_counter = 1
         for ctx in final_contexts:
@@ -1409,97 +1409,36 @@ async def chat(payload: ChatRequest):
             if source_path not in source_to_citation:
                 source_to_citation[source_path] = citation_counter
                 citation_counter += 1
-        
-        # Create sources list with consistent numbering
-        sources_list = []
-        added_sources = set()
-        for source_path in unique_sources:
-            if source_path not in added_sources:
-                citation_number = source_to_citation[source_path]
-                clean_name = os.path.splitext(os.path.basename(source_path))[0]
-                actual_filename = os.path.basename(source_path)
-                sources_list.append(f'<div class="source-item" data-filename="{actual_filename}"><p class="source-name">{clean_name}</p></div>')
-                added_sources.add(source_path)
-        sources_str = "\n".join(sources_list)
+
+        # Build the source legend that goes into the prompt
+        source_legend_lines = []
+        for source_path, cit_num in sorted(source_to_citation.items(), key=lambda x: x[1]):
+            clean_name = os.path.splitext(os.path.basename(source_path))[0]
+            source_legend_lines.append(f"  [{cit_num}] = {clean_name}")
+        source_legend = "\n".join(source_legend_lines)
 
         messages = build_chat_messages(
             query=payload.query,
             contexts=final_contexts,
-            system_prompt=f'''
-                You are a Multimodal RAG agent. Generate responses in VALID HTML format only.
+            source_to_citation=source_to_citation,
+            system_prompt=f"""You are a knowledge-base assistant. Answer the user's question using ONLY the retrieved sources provided below.
 
-**STRICT REQUIREMENTS:**
-1. Respond with COMPLETE HTML document structure
-2. Use proper HTML tags: <p>, <ul>, <li>, <strong>, <em>, etc.
-3. Include citations as [1], [2], etc. within the HTML content
-4. End with --%Sources%-- separator
-5. Follow with proper sources section in HTML format
-6. If images are provided, describe and reference them in your response
-7. If 
+SOURCE MAP (use these exact numbers for citations):
+{source_legend}
 
-**SOURCE SELECTION CRITERIA:**
-- ONLY include sources that directly contribute to answering the user's query
-- If a source is not relevant to the user's question, DO NOT include it in your response
-- It is NOT mandatory to use all provided sources - only use what is necessary
-- The sources provided are candidates detected by algorithms, but you must judge their relevance
-
-**CITATION CONSISTENCY REQUIREMENT:**
-- The citation numbers [1], [2], etc. in the content must correspond to the same numbered sources in the sources section below
-- Source [1] in content must match source [1] in the sources section, source [2] must match, etc.
-- The same document must always use the same citation number throughout the response
-
-**RESPONSE STRUCTURE:**
-```html
-<p>Your main content here with citations [1] and proper HTML formatting.</p>
-<p>Multiple paragraphs are allowed.</p>
-<ul>
-    <li>List items with citations [2]</li>
-    <li>More list items</li>
-</ul>
-<p><strong>Bold text</strong> and <em>italic text</em> are allowed.</p>
---%Sources%--
-<div class="sources-section">
-    <h3>Sources</h3>
-    <div class="source-item">
-        <span class="source-key">1</span>
-        <span class="source-name">source_name_1</span>
-    </div>
-    <div class="source-item">
-        <span class="source-key">2</span>
-        <span class="source-name">source_name_2</span>
-    </div>
-</div>
-```
-
-**CRITICAL:**
-- NO plain text outside HTML tags
-- NO malformed citations like "citation.1"
-- NO text after the sources section
-- ONLY include sources you actually cited in your response
-- Use EXACTLY the source names provided
-- Ensure citation numbers match source numbers (e.g., [1] in content matches [1] in sources)
-- Ensure valid HTML structure
-- The same document must always use the same citation number throughout the response
-
-**EXAMPLES OF INCORRECT RESPONSES TO AVOID:**
-❌ "This is a list item with a citation.1"
-❌ "Sources 1 output"
-❌ Plain text without HTML tags
-❌ Including irrelevant sources that don't contribute to the answer
-
-**EXAMPLES OF CORRECT RESPONSES:**
-✅ "<p>This is properly formatted HTML content [1].</p><p>More content here.</p>--%Sources%--<div class=\"sources-section\"><h3>Sources</h3><div class=\"source-item\"><span class=\"source-key\">1</span><span class=\"source-name\">document.pdf</span></div></div>"
-'''
+RULES:
+1. Output valid HTML only (<p>, <ul>, <li>, <strong>, <em>, <h3>, <ol>, <table>, etc.).
+2. Cite sources inline as [1], [2], etc. — the number must match the SOURCE MAP above.
+3. Use citations in order of first appearance: [1] before [2] before [3].
+4. Only cite a source if you actually used information from it.
+5. Do NOT output a sources/references section — it is added automatically.
+6. Do NOT output plain text outside HTML tags.
+7. Do NOT invent information not present in the sources.
+8. If the sources do not contain enough information, say so honestly.
+"""
         )
 
-        # Append sources info as a separate text block in the user message
-        # (the images + query are already in the message from build_chat_messages)
-        messages[-1]["content"].append({
-            "type": "text",
-            "text": f"\n\n--%Sources%--\n<div class=\"sources-section\">\n<h3>Sources</h3>\n{sources_str}\n</div>"
-        })
-
-        final_answer = call_lm_studio_text(messages, max_tokens=1500, temperature=0.7)
+        final_answer = call_lm_studio_text(messages, max_tokens=1500, temperature=0.5)
 
         return {
             "answer": final_answer
@@ -1525,10 +1464,8 @@ async def chat_stream(payload: ChatRequest):
 
     try:
         final_contexts = contexts
-        context_str = "\n".join([ctx['text'] for ctx in final_contexts])
-        unique_sources = list(set([ctx["source"] for ctx in final_contexts]))
 
-        # Create citation mapping
+        # Create a deterministic, ordered mapping: first-seen source → citation number
         source_to_citation = {}
         citation_counter = 1
         for ctx in final_contexts:
@@ -1537,62 +1474,43 @@ async def chat_stream(payload: ChatRequest):
                 source_to_citation[source_path] = citation_counter
                 citation_counter += 1
 
-        # Build sources HTML
-        sources_list = []
-        added_sources = set()
-        for source_path in unique_sources:
-            if source_path not in added_sources:
-                citation_number = source_to_citation[source_path]
-                clean_name = os.path.splitext(os.path.basename(source_path))[0]
-                actual_filename = os.path.basename(source_path)
-                sources_list.append(f'<div class="source-item" data-filename="{actual_filename}"><p class="source-name">{clean_name}</p></div>')
-                added_sources.add(source_path)
-        sources_str = "\n".join(sources_list)
+        # Build the source legend for the prompt
+        source_legend_lines = []
+        for source_path, cit_num in sorted(source_to_citation.items(), key=lambda x: x[1]):
+            clean_name = os.path.splitext(os.path.basename(source_path))[0]
+            source_legend_lines.append(f"  [{cit_num}] = {clean_name}")
+        source_legend = "\n".join(source_legend_lines)
 
-        # Build the sources metadata to send at the end
+        # Build the sources metadata to send at the end of streaming
         sources_metadata = []
-        added_meta = set()
-        for source_path in unique_sources:
-            if source_path not in added_meta:
-                citation_number = source_to_citation[source_path]
-                clean_name = os.path.splitext(os.path.basename(source_path))[0]
-                actual_filename = os.path.basename(source_path)
-                sources_metadata.append({
-                    "key": citation_number,
-                    "name": clean_name,
-                    "filename": actual_filename
-                })
-                added_meta.add(source_path)
+        for source_path, cit_num in sorted(source_to_citation.items(), key=lambda x: x[1]):
+            clean_name = os.path.splitext(os.path.basename(source_path))[0]
+            actual_filename = os.path.basename(source_path)
+            sources_metadata.append({
+                "key": cit_num,
+                "name": clean_name,
+                "filename": actual_filename
+            })
 
         messages = build_chat_messages(
             query=payload.query,
             contexts=final_contexts,
-            system_prompt=f'''
-                You are a Multimodal RAG agent. Generate responses in VALID HTML format only.
+            source_to_citation=source_to_citation,
+            system_prompt=f"""You are a knowledge-base assistant. Answer the user's question using ONLY the retrieved sources provided below.
 
-**STRICT REQUIREMENTS:**
-1. Respond with COMPLETE HTML document structure
-2. Use proper HTML tags: <p>, <ul>, <li>, <strong>, <em>, etc.
-3. Include citations as [1], [2], etc. within the HTML content
-4. Do NOT include the sources section - it will be added automatically
-5. If images are provided, describe and reference them in your response
+SOURCE MAP (use these exact numbers for citations):
+{source_legend}
 
-**SOURCE SELECTION CRITERIA:**
-- ONLY include sources that directly contribute to answering the user's query
-- Use citation numbers [1], [2], etc. to reference sources
-
-**RESPONSE FORMAT:**
-- Output ONLY the HTML content with citations
-- Do NOT include --%Sources%-- or any sources section
-- Keep it concise and well-formatted
-
-**EXAMPLE:**
-<p>This is properly formatted HTML content [1].</p>
-<p>More content here with another citation [2].</p>
-<ul>
-    <li>List items work too [1]</li>
-</ul>
-'''
+RULES:
+1. Output valid HTML only (<p>, <ul>, <li>, <strong>, <em>, <h3>, <ol>, <table>, etc.).
+2. Cite sources inline as [1], [2], etc. — the number must match the SOURCE MAP above.
+3. Use citations in order of first appearance: [1] before [2] before [3].
+4. Only cite a source if you actually used information from it.
+5. Do NOT output a sources/references section — it is added automatically.
+6. Do NOT output plain text outside HTML tags.
+7. Do NOT invent information not present in the sources.
+8. If the sources do not contain enough information, say so honestly.
+"""
         )
 
         def generate():
@@ -1600,7 +1518,7 @@ async def chat_stream(payload: ChatRequest):
             accumulated_text = []
 
             # Stream the LLM tokens
-            for chunk in stream_lm_studio_text(messages, max_tokens=1500, temperature=0.7):
+            for chunk in stream_lm_studio_text(messages, max_tokens=1500, temperature=0.5):
                 # Filter out any stray [DONE] from inner stream
                 if '[DONE]' in chunk:
                     continue

@@ -482,7 +482,7 @@ const Chat = ({ messages, addMessage, updateLastMessage, clearMessages, showToas
                 placeholder="Ask anything about your knowledge base..."
                 value={chatInput}
                 onChange={handleChatInputChange}
-                onKeyPress={handleKeyPress}
+                onKeyDown={handleKeyPress}
               />
               <button 
                 className="btn btn-primary btn-icon" 

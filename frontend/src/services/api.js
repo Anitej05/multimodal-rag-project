@@ -178,21 +178,8 @@ const api = {
     if (!res.ok) throw new Error(`OCR health check failed: ${res.statusText}`);
     return res.json();
   },
-
-  // --- GPU Mode Switching ---
-  async switchMode(mode) {
-    // mode: 'digitize' or 'rag'
-    const res = await fetch(`${API_BASE_URL}/mode/${mode}`, { method: 'POST' });
-    if (!res.ok) throw new Error(`Mode switch failed: ${res.statusText}`);
-    return res.json();
-  },
-
-  async getModeStatus() {
-    const res = await fetch(`${API_BASE_URL}/mode/status`);
-    if (!res.ok) throw new Error(`Mode status failed: ${res.statusText}`);
-    return res.json();
-  }
 };
 
 export default api;
+
 

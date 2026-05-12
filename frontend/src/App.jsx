@@ -6,7 +6,6 @@ import KnowledgeGraph from './components/KnowledgeGraph';
 import Digitize from './components/Digitize';
 import Toast from './components/Toast';
 import { formatTime } from './utils/helpers';
-import api from './services/api';
 import './styles/knowledgeGraph.css';
 import './styles/digitize.css';
 
@@ -34,9 +33,7 @@ function App() {
   const [toast, setToast] = useState(null);
   const [activeView, setActiveView] = useState('chat'); // 'chat', 'graph', or 'digitize'
   const [isIndexing, setIsIndexing] = useState(false);
-  const [gpuMode, setGpuMode] = useState('rag'); // 'rag' or 'digitize'
-  const [isSwitchingMode, setIsSwitchingMode] = useState(false);
-  const switchingRef = useRef(false);
+
   const [splitRatio, setSplitRatio] = useState(36); // KB panel width %
   const isDragging = useRef(false);
   const containerRef = useRef(null);
@@ -72,37 +69,10 @@ function App() {
     };
   }, []);
 
-  const handleViewChange = useCallback(async (newView) => {
+  const handleViewChange = useCallback((newView) => {
     if (newView === activeView) return;
-    const needsDigitize = newView === 'digitize';
-    const needsRag = newView !== 'digitize';
-    const currentMode = gpuMode;
-
-    // Only switch GPU mode if actually changing between digitize and non-digitize
-    if (needsDigitize && currentMode !== 'digitize') {
-      if (switchingRef.current) return;
-      switchingRef.current = true;
-      // Digitize mode is instant — OCR runs on CPU, no GPU juggling
-      // Fire and forget, update mode state immediately
-      api.switchMode('digitize').catch(e => console.warn('Mode switch to digitize failed:', e));
-      setGpuMode('digitize');
-      switchingRef.current = false;
-    } else if (needsRag && currentMode !== 'rag') {
-      if (switchingRef.current) return;
-      switchingRef.current = true;
-      setIsSwitchingMode(true);
-      try {
-        await api.switchMode('rag');
-        setGpuMode('rag');
-      } catch (e) {
-        console.warn('Mode switch to rag failed:', e);
-      }
-      setIsSwitchingMode(false);
-      switchingRef.current = false;
-    }
-
     setActiveView(newView);
-  }, [activeView, gpuMode]);
+  }, [activeView]);
 
   // Initialize theme state from localStorage or default to light mode
   const [isDarkMode, setIsDarkMode] = useState(() => {
@@ -242,25 +212,7 @@ function App() {
         )}
       </main>
 
-      {/* Mode Switching Overlay */}
-      {isSwitchingMode && (
-        <div style={{
-          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-          background: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(6px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          zIndex: 9999, flexDirection: 'column', gap: '16px'
-        }}>
-          <div style={{
-            width: '40px', height: '40px', border: '3px solid rgba(255,255,255,0.2)',
-            borderTopColor: '#a78bfa', borderRadius: '50%',
-            animation: 'spin 0.8s linear infinite'
-          }} />
-          <div style={{ color: '#e2e8f0', fontSize: '15px', fontWeight: 600 }}>
-            {'Switching back to chat mode...'}
-          </div>
-          <div style={{ color: '#94a3b8', fontSize: '12px' }}>Please wait</div>
-        </div>
-      )}
+
 
       {/* Toast Notification */}
       {toast && <Toast message={toast.message} type={toast.type} />}
