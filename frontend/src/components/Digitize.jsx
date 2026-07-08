@@ -328,7 +328,7 @@ const Digitize = ({ showToast, setUploadedFiles }) => {
                   <span className="dg-format-tag">PDF</span>
                   <span className="dg-format-tag">JPG</span>
                   <span className="dg-format-tag">PNG</span>
-                  <span className="dg-format-tag">WebP</span>
+                  
                 </div>
               </div>
               <input
